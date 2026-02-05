@@ -60,6 +60,7 @@ Commands:
   [l]ist [--short]               List active sessions
   [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
   [k]ill <name>                  Kill a session and all attached clients
+  rename <old> <new>             Rename a session
   [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
   [v]ersion                      Show version information
   [h]elp                         Show this help message
@@ -76,6 +77,7 @@ zmx attach mux dvtm         # run a multiplexer inside zmx
 zmx run dev cat README.md   # run the command without attaching to the session
 zmx r dev cat CHANGELOG.md  # alias
 echo "ls -lah" | zmx r dev  # use stdin to run the command
+zmx rename dev my-app       # rename a session
 ```
 
 ## shell prompt

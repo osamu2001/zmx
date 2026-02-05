@@ -321,6 +321,110 @@ const Daemon = struct {
         self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
     }
+
+    fn appendAck(self: *Daemon, client: *Client, msg: []const u8) void {
+        ipc.appendMessage(self.alloc, &client.write_buf, .Ack, msg) catch |err| {
+            std.log.warn("failed to buffer ack err={s}", .{@errorName(err)});
+            return;
+        };
+        client.has_pending_output = true;
+    }
+
+    pub fn handleRename(self: *Daemon, client: *Client, payload: []const u8) void {
+        if (payload.len == 0) {
+            self.appendAck(client, "missing new session name");
+            return;
+        }
+        if (std.mem.indexOfScalar(u8, payload, '/')) |_| {
+            self.appendAck(client, "session name cannot contain '/'");
+            return;
+        }
+        if (std.mem.eql(u8, payload, self.session_name)) {
+            self.appendAck(client, "new session name is same as current");
+            return;
+        }
+
+        var dir = std.fs.openDirAbsolute(self.cfg.socket_dir, .{}) catch |err| {
+            std.log.err("failed to open socket dir err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to open socket dir");
+            return;
+        };
+        defer dir.close();
+
+        const exists = sessionExists(dir, payload) catch |err| {
+            std.log.err("failed to check existing session err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to check existing session");
+            return;
+        };
+        if (exists) {
+            self.appendAck(client, "target session already exists");
+            return;
+        }
+
+        const new_socket_path = getSocketPath(self.alloc, self.cfg.socket_dir, payload) catch |err| {
+            std.log.err("failed to build socket path err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to build socket path");
+            return;
+        };
+
+        std.fs.renameAbsolute(self.socket_path, new_socket_path) catch |err| {
+            std.log.err("failed to rename socket err={s}", .{@errorName(err)});
+            self.alloc.free(new_socket_path);
+            self.appendAck(client, "failed to rename socket");
+            return;
+        };
+
+        const old_log_name = std.fmt.allocPrint(self.alloc, "{s}.log", .{self.session_name}) catch |err| {
+            std.log.err("failed to build old log name err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to build old log name");
+            return;
+        };
+        defer self.alloc.free(old_log_name);
+
+        const old_log_path = std.fs.path.join(self.alloc, &.{ self.cfg.log_dir, old_log_name }) catch |err| {
+            std.log.err("failed to build old log path err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to build old log path");
+            return;
+        };
+        defer self.alloc.free(old_log_path);
+
+        const new_log_name = std.fmt.allocPrint(self.alloc, "{s}.log", .{payload}) catch |err| {
+            std.log.err("failed to build new log name err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to build new log name");
+            return;
+        };
+        defer self.alloc.free(new_log_name);
+
+        const new_log_path = std.fs.path.join(self.alloc, &.{ self.cfg.log_dir, new_log_name }) catch |err| {
+            std.log.err("failed to build new log path err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to build new log path");
+            return;
+        };
+        defer self.alloc.free(new_log_path);
+
+        log_system.deinit();
+        std.fs.renameAbsolute(old_log_path, new_log_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {
+                std.debug.print("failed to rename log file err={s}\n", .{@errorName(err)});
+            },
+        };
+
+        log_system.init(self.alloc, new_log_path) catch |err| {
+            std.debug.print("failed to reinit log file err={s}\n", .{@errorName(err)});
+        };
+
+        const new_session_name = self.alloc.dupe(u8, payload) catch |err| {
+            std.log.err("failed to store new session name err={s}", .{@errorName(err)});
+            self.appendAck(client, "failed to store new session name");
+            return;
+        };
+        self.session_name = new_session_name;
+        self.alloc.free(self.socket_path);
+        self.socket_path = new_socket_path;
+
+        self.appendAck(client, "");
+    }
 };
 
 pub fn main() !void {
@@ -361,6 +465,20 @@ pub fn main() !void {
             return error.SessionNameRequired;
         };
         return kill(&cfg, session_name);
+    } else if (std.mem.eql(u8, cmd, "rename") or std.mem.eql(u8, cmd, "rn")) {
+        const old_name = args.next() orelse {
+            return error.SessionNameRequired;
+        };
+        const new_name = args.next() orelse {
+            return error.SessionNameRequired;
+        };
+        renameSession(&cfg, old_name, new_name) catch |err| {
+            if (err != error.RenameFailed) {
+                std.log.err("rename failed err={s}", .{@errorName(err)});
+            }
+            std.process.exit(1);
+        };
+        return;
     } else if (std.mem.eql(u8, cmd, "history") or std.mem.eql(u8, cmd, "hi")) {
         var session_name: ?[]const u8 = null;
         var format: HistoryFormat = .plain;
@@ -478,6 +596,7 @@ fn help() !void {
         \\  [l]ist [--short]              List active sessions
         \\  [c]ompletions <shell>         Completion scripts for shell integration (bash, zsh, or fish)
         \\  [k]ill <name>                 Kill a session and all attached clients
+        \\  rename <old> <new>            Rename a session
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [v]ersion                     Show version information
         \\  [h]elp                        Show this help message
@@ -656,6 +775,91 @@ fn kill(cfg: *Cfg, session_name: []const u8) !void {
     var w = std.fs.File.stdout().writer(&buf);
     try w.interface.print("killed session {s}\n", .{session_name});
     try w.interface.flush();
+}
+
+fn renameSession(cfg: *Cfg, old_name: []const u8, new_name: []const u8) !void {
+    var err_buf: [4096]u8 = undefined;
+    var err_writer = std.fs.File.stderr().writer(&err_buf);
+
+    if (std.mem.eql(u8, old_name, new_name)) {
+        std.log.err("new session name matches current name", .{});
+        err_writer.interface.print("new session name matches current name\n", .{}) catch {};
+        err_writer.interface.flush() catch {};
+        return error.RenameFailed;
+    }
+    if (std.mem.indexOfScalar(u8, new_name, '/')) |_| {
+        std.log.err("session name cannot contain '/'", .{});
+        err_writer.interface.print("session name cannot contain '/'\n", .{}) catch {};
+        err_writer.interface.flush() catch {};
+        return error.RenameFailed;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const old_exists = try sessionExists(dir, old_name);
+    if (!old_exists) {
+        std.log.err("session does not exist session_name={s}", .{old_name});
+        err_writer.interface.print("session does not exist session_name={s}\n", .{old_name}) catch {};
+        err_writer.interface.flush() catch {};
+        return error.RenameFailed;
+    }
+
+    const new_exists = sessionExists(dir, new_name) catch |err| {
+        std.log.err("failed to check existing session err={s}", .{@errorName(err)});
+        return error.RenameFailed;
+    };
+    if (new_exists) {
+        std.log.err("session already exists session_name={s}", .{new_name});
+        err_writer.interface.print("session already exists session_name={s}\n", .{new_name}) catch {};
+        err_writer.interface.flush() catch {};
+        return error.RenameFailed;
+    }
+
+    const socket_path = try getSocketPath(alloc, cfg.socket_dir, old_name);
+    defer alloc.free(socket_path);
+
+    const result = probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        cleanupStaleSocket(dir, old_name);
+        return error.RenameFailed;
+    };
+    defer posix.close(result.fd);
+
+    try ipc.send(result.fd, .Rename, new_name);
+
+    var poll_fds = [_]posix.pollfd{.{ .fd = result.fd, .events = posix.POLL.IN, .revents = 0 }};
+    const poll_result = posix.poll(&poll_fds, 5000) catch return error.PollFailed;
+    if (poll_result == 0) {
+        std.log.err("timeout waiting for ack", .{});
+        return error.Timeout;
+    }
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    const n = sb.read(result.fd) catch return error.ReadFailed;
+    if (n == 0) return error.ConnectionClosed;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == .Ack) {
+            if (msg.payload.len > 0) {
+                std.log.err("{s}", .{msg.payload});
+                return error.RenameFailed;
+            }
+            var buf: [4096]u8 = undefined;
+            var w = std.fs.File.stdout().writer(&buf);
+            try w.interface.print("renamed session {s} -> {s}\n", .{ old_name, new_name });
+            try w.interface.flush();
+            return;
+        }
+    }
+
+    return error.NoAckReceived;
 }
 
 const HistoryFormat = enum(u8) {
@@ -1244,6 +1448,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
+                        .Rename => daemon.handleRename(client, msg.payload),
                         .Output, .Ack => {},
                     }
                 }
