@@ -134,16 +134,7 @@ pub fn main() !void {
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon) catch |err| switch (err) {
-            error.CannotAttachToSessionInSession => {
-                var buf: [4096]u8 = undefined;
-                var w = std.fs.File.stderr().writer(&buf);
-                try w.interface.print(
-                    "error: cannot attach from inside a zmx session; detach/exit first, or clear stale ZMX_SESSION if the previous session is already gone\n",
-                    .{},
-                );
-                try w.interface.flush();
-                return;
-            },
+            error.CannotAttachToSessionInSession => return printAttachInsideSessionError(),
             else => return err,
         };
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
@@ -626,25 +617,27 @@ const Daemon = struct {
         self.clients.clearRetainingCapacity();
     }
 
+    fn logSignalFailure(sig_name: []const u8, target: []const u8, pid: posix.pid_t, err: anyerror) void {
+        std.log.warn(
+            "failed to send {s} to {s} pid={d} err={s}",
+            .{ sig_name, target, pid, @errorName(err) },
+        );
+    }
+
     fn signalSessionProcess(pid: posix.pid_t, sig: u8, sig_name: []const u8) void {
         posix.kill(-pid, sig) catch |err| {
-            if (err == error.PermissionDenied) {
-                posix.kill(pid, sig) catch |direct_err| {
-                    if (direct_err != error.ProcessNotFound) {
-                        std.log.warn(
-                            "failed to send {s} to pid={d} err={s}",
-                            .{ sig_name, pid, @errorName(direct_err) },
-                        );
-                    }
-                };
+            if (err != error.PermissionDenied) {
+                if (err != error.ProcessNotFound) {
+                    logSignalFailure(sig_name, "process group", pid, err);
+                }
                 return;
             }
-            if (err != error.ProcessNotFound) {
-                std.log.warn(
-                    "failed to send {s} to process group pid={d} err={s}",
-                    .{ sig_name, pid, @errorName(err) },
-                );
-            }
+
+            posix.kill(pid, sig) catch |direct_err| {
+                if (direct_err != error.ProcessNotFound) {
+                    logSignalFailure(sig_name, "pid", pid, direct_err);
+                }
+            };
         };
     }
 
@@ -821,6 +814,16 @@ fn help() !void {
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
     try w.interface.print(help_text, .{});
+    try w.interface.flush();
+}
+
+fn printAttachInsideSessionError() !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    try w.interface.print(
+        "error: cannot attach from inside a zmx session; detach/exit first, or clear stale ZMX_SESSION if the previous session is already gone\n",
+        .{},
+    );
     try w.interface.flush();
 }
 
