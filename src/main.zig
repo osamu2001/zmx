@@ -133,7 +133,19 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(&daemon);
+        return attach(&daemon) catch |err| switch (err) {
+            error.CannotAttachToSessionInSession => {
+                var buf: [4096]u8 = undefined;
+                var w = std.fs.File.stderr().writer(&buf);
+                try w.interface.print(
+                    "error: cannot attach from inside a zmx session; detach/exit first, or clear stale ZMX_SESSION if the previous session is already gone\n",
+                    .{},
+                );
+                try w.interface.flush();
+                return;
+            },
+            else => return err,
+        };
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
 
@@ -474,10 +486,8 @@ const Daemon = struct {
                 };
 
                 defer {
-                    self.handleKill();
+                    self.handleKill(pty_fd);
                     self.deinit();
-                    _ = posix.waitpid(self.pid, 0);
-                    posix.close(pty_fd);
                     posix.close(server_sock_fd);
                     std.log.info("deleting socket file session_name={s}", .{self.session_name});
                     dir.deleteFile(self.session_name) catch |err| {
@@ -616,7 +626,39 @@ const Daemon = struct {
         self.clients.clearRetainingCapacity();
     }
 
-    pub fn handleKill(self: *Daemon) void {
+    fn signalSessionProcess(pid: posix.pid_t, sig: u8, sig_name: []const u8) void {
+        posix.kill(-pid, sig) catch |err| {
+            if (err == error.PermissionDenied) {
+                posix.kill(pid, sig) catch |direct_err| {
+                    if (direct_err != error.ProcessNotFound) {
+                        std.log.warn(
+                            "failed to send {s} to pid={d} err={s}",
+                            .{ sig_name, pid, @errorName(direct_err) },
+                        );
+                    }
+                };
+                return;
+            }
+            if (err != error.ProcessNotFound) {
+                std.log.warn(
+                    "failed to send {s} to process group pid={d} err={s}",
+                    .{ sig_name, pid, @errorName(err) },
+                );
+            }
+        };
+    }
+
+    fn waitForChildExit(pid: posix.pid_t, timeout_ms: u64) bool {
+        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (true) {
+            const result = posix.waitpid(pid, std.c.W.NOHANG);
+            if (result.pid == pid) return true;
+            if (std.time.milliTimestamp() >= deadline) return false;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    pub fn handleKill(self: *Daemon, pty_fd: i32) void {
         std.log.info("kill received session={s}", .{self.session_name});
         self.shutdown();
         // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
@@ -624,13 +666,13 @@ const Daemon = struct {
         //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
         // negative pid means kill process and children
         std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
-        posix.kill(-self.pid, posix.SIG.HUP) catch |err| {
-            std.log.warn("failed to send SIGHUP to pty child err={s}", .{@errorName(err)});
-        };
+        signalSessionProcess(self.pid, posix.SIG.HUP, "SIGHUP");
         std.Thread.sleep(500 * std.time.ns_per_ms);
-        posix.kill(-self.pid, posix.SIG.KILL) catch |err| {
-            std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
-        };
+        signalSessionProcess(self.pid, posix.SIG.KILL, "SIGKILL");
+        posix.close(pty_fd);
+        if (!waitForChildExit(self.pid, 1000)) {
+            std.log.warn("pty child did not exit after shutdown session={s} pid={d}", .{ self.session_name, self.pid });
+        }
     }
 
     pub fn handleInfo(self: *Daemon, client: *Client) !void {
@@ -780,6 +822,18 @@ fn help() !void {
     var w = std.fs.File.stdout().writer(&buf);
     try w.interface.print(help_text, .{});
     try w.interface.flush();
+}
+
+fn waitForSocketCleanup(socket_path: []const u8, timeout_ms: u64) bool {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        std.fs.accessAbsolute(socket_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return false,
+        };
+        if (std.time.milliTimestamp() >= deadline) return false;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
 }
 
 fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
@@ -1006,7 +1060,11 @@ fn kill(cfg: *Cfg, session_name: []const u8) !void {
 
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("killed session {s}\n", .{session_name});
+    if (waitForSocketCleanup(socket_path, 1000)) {
+        try w.interface.print("killed session {s}\n", .{session_name});
+    } else {
+        try w.interface.print("kill requested for session {s}, cleanup pending\n", .{session_name});
+    }
     try w.interface.flush();
 }
 

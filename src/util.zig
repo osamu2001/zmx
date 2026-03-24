@@ -50,6 +50,13 @@ pub fn get_session_entries(
             defer alloc.free(socket_path);
 
             const result = ipc.probeSession(alloc, socket_path) catch |err| {
+                // The directory iterator can race with daemon cleanup: if the
+                // socket disappeared after we read the entry but before probe,
+                // treat it as already gone rather than a lingering unreachable
+                // session.
+                const still_exists = socket.sessionExists(dir, entry.name) catch false;
+                if (!still_exists) continue;
+
                 try sessions.append(alloc, .{
                     .name = name,
                     .pid = null,
