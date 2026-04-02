@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="create attach run detach info input send-keys interrupt signal stop list completions kill history version help"
+    \\  local commands="create attach run detach info input send-keys set-meta get-meta remove-meta interrupt signal stop list completions kill history version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,9 +37,15 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    create|attach|run|info|input|send-keys|interrupt|signal|stop|kill|history)
+    \\    create|attach|run|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|kill|history)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
+    \\      ;;
+    \\    set-meta)
+    \\      COMPREPLY=($(compgen -W "--json" -- "$cur"))
+    \\      ;;
+    \\    get-meta)
+    \\      COMPREPLY=($(compgen -W "--json" -- "$cur"))
     \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
@@ -92,6 +98,9 @@ const zsh_completions =
     \\        'info:Show session details'
     \\        'input:Send text input without attaching'
     \\        'send-keys:Send special keys without attaching'
+    \\        'set-meta:Store session metadata'
+    \\        'get-meta:Read session metadata'
+    \\        'remove-meta:Remove session metadata'
     \\        'interrupt:Send SIGINT to foreground process group'
     \\        'signal:Send a signal to foreground or session tree'
     \\        'stop:Gracefully stop a session'
@@ -106,8 +115,11 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        create|attach|a|kill|k|run|r|info|input|send-keys|interrupt|signal|stop|history|hi)
+    \\        create|attach|a|kill|k|run|r|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|history|hi)
     \\          _zmx_sessions
+    \\          ;;
+    \\        set-meta|get-meta)
+    \\          _values 'options' '--json'
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
@@ -162,6 +174,9 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'info' -d 'Show session details'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'input' -d 'Send text input without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'send-keys' -d 'Send special keys without attaching'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'set-meta' -d 'Store session metadata'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'get-meta' -d 'Read session metadata'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'remove-meta' -d 'Remove session metadata'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'interrupt' -d 'Send SIGINT to foreground process group'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'signal' -d 'Send a signal to foreground or session tree'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'stop' -d 'Gracefully stop a session'
@@ -175,7 +190,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
     \\complete -c zmx -s h -d 'Show help message'
     \\
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from create a attach r run info input send-keys interrupt signal stop k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from create a attach r run info input send-keys set-meta get-meta remove-meta interrupt signal stop k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
     \\
@@ -183,6 +198,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from input" -l enter -d 'Append carriage return'
     \\complete -c zmx -n "__fish_seen_subcommand_from input" -l no-newline -d 'Do not append a newline'
     \\complete -c zmx -n "__fish_seen_subcommand_from send-keys; and not __fish_is_nth_token 2" -a 'enter escape ctrl-c up down left right tab backspace' -d 'Special key'
+    \\complete -c zmx -n "__fish_seen_subcommand_from set-meta get-meta" -l json -d 'JSON value/output'
     \\complete -c zmx -n "__fish_seen_subcommand_from interrupt" -l best-effort -d 'Ignore missing foreground process'
     \\complete -c zmx -n "__fish_seen_subcommand_from signal; and not __fish_is_nth_token 2" -a 'int term hup kill quit usr1 usr2' -d 'Signal name'
     \\complete -c zmx -n "__fish_seen_subcommand_from signal" -l foreground -d 'Target foreground process group'
@@ -219,6 +235,16 @@ test "completion scripts include send-keys command" {
     try std.testing.expect(std.mem.indexOf(u8, bash_completions, "send-keys") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "send-keys:Send special keys without attaching") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'send-keys' -d 'Send special keys without attaching'") != null);
+}
+
+test "completion scripts include metadata commands" {
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "set-meta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "get-meta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "remove-meta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "set-meta:Store session metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "get-meta:Read session metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'set-meta' -d 'Store session metadata'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "-l json -d 'JSON value/output'") != null);
 }
 
 test "completion scripts include interrupt and signal commands" {

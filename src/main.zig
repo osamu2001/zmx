@@ -52,7 +52,7 @@ fn currentTimestamp() u64 {
 
 fn exitCodeForError(err: anyerror) u8 {
     return switch (err) {
-        error.SessionNotFound => @intFromEnum(ExitCode.not_found),
+        error.SessionNotFound, error.MetaKeyNotFound => @intFromEnum(ExitCode.not_found),
         error.Timeout, error.SessionNotReady => @intFromEnum(ExitCode.timeout),
         error.SessionNameRequired,
         error.InvalidSessionName,
@@ -175,6 +175,49 @@ fn realMain() !void {
         const payload = try buildSendKeysPayload(alloc, keys.items);
         defer alloc.free(payload);
         return sendPayload(&cfg, sesh, payload, "keys sent");
+    } else if (std.mem.eql(u8, cmd, "set-meta")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        const key = args.next() orelse return error.CommandRequired;
+        var json_value = false;
+        var value_parts: std.ArrayList([]const u8) = .empty;
+        defer value_parts.deinit(alloc);
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--json") and value_parts.items.len == 0 and !json_value) {
+                json_value = true;
+            } else {
+                try value_parts.append(alloc, arg);
+            }
+        }
+
+        const value_json = try buildMetaValueJson(alloc, value_parts.items, json_value);
+        defer alloc.free(value_json);
+        return setMeta(&cfg, sesh, key, value_json);
+    } else if (std.mem.eql(u8, cmd, "get-meta")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        var key: ?[]const u8 = null;
+        var json = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
+            } else if (key == null) {
+                key = arg;
+            }
+        }
+
+        return getMeta(&cfg, sesh, key, json);
+    } else if (std.mem.eql(u8, cmd, "remove-meta")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        const key = args.next() orelse return error.CommandRequired;
+        return removeMeta(&cfg, sesh, key);
     } else if (std.mem.eql(u8, cmd, "interrupt")) {
         const session_name = args.next() orelse "";
         const sesh = try socket.getSeshName(alloc, session_name);
@@ -354,6 +397,7 @@ fn initSessionDaemon(
         .last_output_at = null,
         .last_input_at = null,
         .last_client_attach_at = null,
+        .meta = std.StringArrayHashMap([]u8).init(alloc),
         .is_task_mode = is_task_mode,
         .task_command = task_command,
     };
@@ -471,12 +515,19 @@ const Daemon = struct {
     last_output_at: ?u64 = null,
     last_input_at: ?u64 = null,
     last_client_attach_at: ?u64 = null,
+    meta: std.StringArrayHashMap([]u8),
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     task_command: ?[]const []const u8 = null,
 
     pub fn deinit(self: *Daemon) void {
+        var meta_iter = self.meta.iterator();
+        while (meta_iter.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.meta.deinit();
         self.clients.deinit(self.alloc);
         self.alloc.free(self.socket_path);
     }
@@ -885,6 +936,99 @@ const Daemon = struct {
         client.has_pending_output = true;
     }
 
+    fn setMetaValue(self: *Daemon, key: []const u8, value_json: []const u8) !void {
+        if (self.meta.getPtr(key)) |value_ptr| {
+            self.alloc.free(value_ptr.*);
+            value_ptr.* = try self.alloc.dupe(u8, value_json);
+            return;
+        }
+
+        try self.meta.put(
+            try self.alloc.dupe(u8, key),
+            try self.alloc.dupe(u8, value_json),
+        );
+    }
+
+    fn removeMetaValue(self: *Daemon, key: []const u8) void {
+        if (self.meta.fetchSwapRemove(key)) |entry| {
+            self.alloc.free(entry.key);
+            self.alloc.free(entry.value);
+        }
+    }
+
+    fn serializeMetaObject(self: *Daemon) ![]u8 {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(self.alloc);
+
+        var iter = self.meta.iterator();
+        while (iter.next()) |entry| {
+            try keys.append(self.alloc, entry.key_ptr.*);
+        }
+
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.order(u8, lhs, rhs) == .lt;
+            }
+        }.lessThan);
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.alloc);
+        var writer = payload.writer(self.alloc);
+
+        try writer.writeByte('{');
+        for (keys.items, 0..) |key, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{f}", .{std.json.fmt(key, .{})});
+            try writer.writeByte(':');
+            try writer.writeAll(self.meta.get(key).?);
+        }
+        try writer.writeByte('}');
+
+        return payload.toOwnedSlice(self.alloc);
+    }
+
+    fn appendMetaResponse(self: *Daemon, client: *Client, status: ipc.MetaStatus, json_payload: []const u8) !void {
+        var response = try std.ArrayList(u8).initCapacity(self.alloc, 1 + json_payload.len);
+        defer response.deinit(self.alloc);
+        try response.append(self.alloc, @intFromEnum(status));
+        try response.appendSlice(self.alloc, json_payload);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Meta, response.items);
+        client.has_pending_output = true;
+    }
+
+    pub fn handleSetMeta(self: *Daemon, client: *Client, payload: []const u8) !void {
+        const sep = std.mem.indexOfScalar(u8, payload, 0) orelse return error.CommandRequired;
+        const key = payload[0..sep];
+        const value_json = payload[sep + 1 ..];
+        if (key.len == 0 or value_json.len == 0) return error.CommandRequired;
+
+        try self.setMetaValue(key, value_json);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
+        client.has_pending_output = true;
+    }
+
+    pub fn handleGetMeta(self: *Daemon, client: *Client, payload: []const u8) !void {
+        if (payload.len == 0) {
+            const meta_json = try self.serializeMetaObject();
+            defer self.alloc.free(meta_json);
+            try self.appendMetaResponse(client, .ok, meta_json);
+            return;
+        }
+
+        const value_json = self.meta.get(payload) orelse {
+            try self.appendMetaResponse(client, .not_found, "");
+            return;
+        };
+        try self.appendMetaResponse(client, .ok, value_json);
+    }
+
+    pub fn handleRemoveMeta(self: *Daemon, client: *Client, payload: []const u8) !void {
+        if (payload.len == 0) return error.CommandRequired;
+        self.removeMetaValue(payload);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
+        client.has_pending_output = true;
+    }
+
     pub fn handleHistory(
         self: *Daemon,
         client: *Client,
@@ -1024,6 +1168,119 @@ fn formatOptionalTimestampUtc(alloc: std.mem.Allocator, timestamp: u64) !?[]u8 {
     return try formatTimestampUtc(alloc, timestamp);
 }
 
+fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+}
+
+fn buildMetaValueJson(
+    alloc: std.mem.Allocator,
+    value_parts: []const []const u8,
+    json_value: bool,
+) ![]u8 {
+    if (value_parts.len == 0) return error.CommandRequired;
+
+    const joined = try std.mem.join(alloc, " ", value_parts);
+    defer alloc.free(joined);
+
+    if (!json_value) {
+        return jsonStringifyAlloc(alloc, joined);
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, joined, .{});
+    defer parsed.deinit();
+    return jsonStringifyAlloc(alloc, parsed.value);
+}
+
+fn buildSetMetaPayload(alloc: std.mem.Allocator, key: []const u8, value_json: []const u8) ![]u8 {
+    if (key.len == 0 or value_json.len == 0) return error.CommandRequired;
+    var payload = try std.ArrayList(u8).initCapacity(alloc, key.len + 1 + value_json.len);
+    defer payload.deinit(alloc);
+    try payload.appendSlice(alloc, key);
+    try payload.append(alloc, 0);
+    try payload.appendSlice(alloc, value_json);
+    return payload.toOwnedSlice(alloc);
+}
+
+fn writeJsonField(writer: anytype, first: *bool, key: []const u8, value: anytype) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.print("{f}", .{std.json.fmt(key, .{})});
+    try writer.writeByte(':');
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+fn writeRawJsonField(writer: anytype, first: *bool, key: []const u8, raw_json: []const u8) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.print("{f}", .{std.json.fmt(key, .{})});
+    try writer.writeByte(':');
+    try writer.writeAll(raw_json);
+}
+
+const SessionMetaResult = struct {
+    json_payload: []u8,
+    found: bool,
+};
+
+fn requestSessionMeta(
+    alloc: std.mem.Allocator,
+    cfg: *Cfg,
+    session_name: []const u8,
+    key: ?[]const u8,
+) !SessionMetaResult {
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
+        error.OutOfMemory => return err,
+    };
+    defer alloc.free(socket_path);
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, session_name);
+    if (!exists) {
+        return error.SessionNotFound;
+    }
+
+    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
+        return err;
+    };
+    defer posix.close(result.fd);
+
+    const request_key = key orelse "";
+    ipc.send(result.fd, .GetMeta, request_key) catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return error.Unexpected,
+        else => return err,
+    };
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    while (true) {
+        var poll_fds = [_]posix.pollfd{.{ .fd = result.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const poll_result = posix.poll(&poll_fds, 5000) catch return error.PollFailed;
+        if (poll_result == 0) return error.Timeout;
+
+        const n = sb.read(result.fd) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
+
+        while (sb.next()) |msg| {
+            if (msg.header.tag != .Meta or msg.payload.len == 0) continue;
+            const status: ipc.MetaStatus = @enumFromInt(msg.payload[0]);
+            const json_payload = try alloc.dupe(u8, msg.payload[1..]);
+            return .{
+                .json_payload = json_payload,
+                .found = status == .ok,
+            };
+        }
+    }
+}
+
 fn help() !void {
     const help_text =
         \\zmx - session persistence for terminal processes
@@ -1038,6 +1295,9 @@ fn help() !void {
         \\  info <name> [--json]           Show session details
         \\  input <name> [text...]         Send text input without attaching (--stdin/--enter/--no-newline)
         \\  send-keys <name> <keys...>     Send special keys without attaching (enter/escape/ctrl-c/arrows)
+        \\  set-meta <name> <key> <value>  Store session metadata (--json for raw JSON)
+        \\  get-meta <name> [key]          Read session metadata (--json for raw JSON output)
+        \\  remove-meta <name> <key>       Remove session metadata
         \\  interrupt <name>               Send SIGINT to the foreground process group
         \\  signal <name> <sig>            Send a signal (--foreground|--session-tree, --best-effort)
         \\  stop <name>                    Gracefully stop a session (--timeout-ms, --escalate, --best-effort)
@@ -1112,6 +1372,8 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
         null;
     const created_at = try formatTimestampUtc(alloc, result.info.created_at);
     defer alloc.free(created_at);
+    const meta_result = try requestSessionMeta(alloc, cfg, session_name, null);
+    defer alloc.free(meta_result.json_payload);
     const last_activity_at = try formatOptionalTimestampUtc(alloc, result.info.last_activity_at);
     defer if (last_activity_at) |value| alloc.free(value);
     const last_output_at = try formatOptionalTimestampUtc(alloc, result.info.last_output_at);
@@ -1138,46 +1400,27 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
     if (json) {
         var out_buf: [4096]u8 = undefined;
         var out = std.fs.File.stdout().writer(&out_buf);
-        const payload: struct {
-            name: []const u8,
-            state: []const u8,
-            healthy: bool,
-            pid: i32,
-            clients: usize,
-            cmd: ?[]const u8,
-            cwd: ?[]const u8,
-            created_at: []const u8,
-            last_activity_at: ?[]const u8,
-            last_output_at: ?[]const u8,
-            last_input_at: ?[]const u8,
-            last_client_attach_at: ?[]const u8,
-            task: struct {
-                running: bool,
-                ended_at: ?[]const u8,
-                exit_code: ?u8,
-            },
-            meta: struct {},
-        } = .{
-            .name = session_name,
-            .state = state,
-            .healthy = true,
-            .pid = result.info.pid,
-            .clients = result.info.clients_len,
-            .cmd = cmd,
-            .cwd = cwd,
-            .created_at = created_at,
-            .last_activity_at = last_activity_at,
-            .last_output_at = last_output_at,
-            .last_input_at = last_input_at,
-            .last_client_attach_at = last_client_attach_at,
-            .task = .{
-                .running = task_running,
-                .ended_at = task_ended_at,
-                .exit_code = task_exit_code,
-            },
-            .meta = .{},
-        };
-        try out.interface.print("{f}\n", .{std.json.fmt(payload, .{})});
+        var first = true;
+        try out.interface.writeByte('{');
+        try writeJsonField(&out.interface, &first, "name", session_name);
+        try writeJsonField(&out.interface, &first, "state", state);
+        try writeJsonField(&out.interface, &first, "healthy", true);
+        try writeJsonField(&out.interface, &first, "pid", result.info.pid);
+        try writeJsonField(&out.interface, &first, "clients", result.info.clients_len);
+        try writeJsonField(&out.interface, &first, "cmd", cmd);
+        try writeJsonField(&out.interface, &first, "cwd", cwd);
+        try writeJsonField(&out.interface, &first, "created_at", created_at);
+        try writeJsonField(&out.interface, &first, "last_activity_at", last_activity_at);
+        try writeJsonField(&out.interface, &first, "last_output_at", last_output_at);
+        try writeJsonField(&out.interface, &first, "last_input_at", last_input_at);
+        try writeJsonField(&out.interface, &first, "last_client_attach_at", last_client_attach_at);
+        try writeJsonField(&out.interface, &first, "task", .{
+            .running = task_running,
+            .ended_at = task_ended_at,
+            .exit_code = task_exit_code,
+        });
+        try writeRawJsonField(&out.interface, &first, "meta", meta_result.json_payload);
+        try out.interface.writeAll("}\n");
         try out.interface.flush();
         return;
     }
@@ -1196,6 +1439,7 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
     if (last_client_attach_at) |value| try out.interface.print("last_client_attach_at={s}\n", .{value});
     if (cwd) |value| try out.interface.print("cwd={s}\n", .{value});
     if (cmd) |value| try out.interface.print("cmd={s}\n", .{value});
+    if (!std.mem.eql(u8, meta_result.json_payload, "{}")) try out.interface.print("meta={s}\n", .{meta_result.json_payload});
     try out.interface.print("task_running={s}\n", .{if (task_running) "true" else "false"});
     if (task_ended_at) |value| try out.interface.print("task_ended_at={s}\n", .{value});
     if (task_exit_code) |value| try out.interface.print("task_exit_code={d}\n", .{value});
@@ -1348,6 +1592,66 @@ fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
     try w.interface.print("{s}\n", .{success_message});
+    try w.interface.flush();
+}
+
+fn setMeta(cfg: *Cfg, session_name: []const u8, key: []const u8, value_json: []const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const payload = try buildSetMetaPayload(alloc, key, value_json);
+    defer alloc.free(payload);
+    try dispatchSessionControl(cfg, session_name, .SetMeta, payload);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("meta updated\n", .{});
+    try w.interface.flush();
+}
+
+fn getMeta(cfg: *Cfg, session_name: []const u8, key: ?[]const u8, json: bool) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const result = try requestSessionMeta(alloc, cfg, session_name, key);
+    defer alloc.free(result.json_payload);
+    if (!result.found) {
+        var errbuf: [4096]u8 = undefined;
+        var stderr = std.fs.File.stderr().writer(&errbuf);
+        if (key) |meta_key| {
+            stderr.interface.print("error: metadata key \"{s}\" not found\n", .{meta_key}) catch {};
+        } else {
+            stderr.interface.print("error: metadata not found\n", .{}) catch {};
+        }
+        stderr.interface.flush() catch {};
+        return error.MetaKeyNotFound;
+    }
+
+    var outbuf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&outbuf);
+    if (json or key == null) {
+        try stdout.interface.print("{s}\n", .{result.json_payload});
+        try stdout.interface.flush();
+        return;
+    }
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json_payload, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .string => |value| try stdout.interface.print("{s}\n", .{value}),
+        else => try stdout.interface.print("{s}\n", .{result.json_payload}),
+    }
+    try stdout.interface.flush();
+}
+
+fn removeMeta(cfg: *Cfg, session_name: []const u8, key: []const u8) !void {
+    try dispatchSessionControl(cfg, session_name, .RemoveMeta, key);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("meta removed\n", .{});
     try w.interface.flush();
 }
 
@@ -2235,6 +2539,32 @@ test "parseSignalName accepts symbolic and numeric forms" {
     try std.testing.expectError(error.UnsupportedSignal, parseSignalName("banana"));
 }
 
+test "buildMetaValueJson stringifies plain text and canonicalizes json" {
+    const alloc = std.testing.allocator;
+
+    const string_value = try buildMetaValueJson(alloc, &.{ "ready", "soon" }, false);
+    defer alloc.free(string_value);
+    try std.testing.expectEqualStrings("\"ready soon\"", string_value);
+
+    const json_value = try buildMetaValueJson(alloc, &.{"{\"ready\":true,\"count\":1}"}, true);
+    defer alloc.free(json_value);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(true, parsed.value.object.get("ready").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+}
+
+test "buildSetMetaPayload joins key and value json" {
+    const alloc = std.testing.allocator;
+    const payload = try buildSetMetaPayload(alloc, "alias", "\"controller\"");
+    defer alloc.free(payload);
+
+    try std.testing.expectEqualStrings("alias", payload[0..5]);
+    try std.testing.expectEqual(@as(u8, 0), payload[5]);
+    try std.testing.expectEqualStrings("\"controller\"", payload[6..]);
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 fn clientLoop(client_sock_fd: i32) !void {
@@ -2359,7 +2689,8 @@ fn clientLoop(client_sock_fd: i32) !void {
                             try stdout_buf.appendSlice(alloc, msg.payload);
                         }
                     },
-                    else => {},
+                    .Meta, .Ack, .Info, .History, .Input, .Resize, .Detach, .DetachAll, .Kill, .Init, .Run, .Interrupt, .Signal, .SetMeta, .GetMeta, .RemoveMeta => {},
+                    _ => {},
                 }
             }
         }
@@ -2596,7 +2927,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Signal => try daemon.handleSignal(pty_fd, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
-                        .Output, .Ack => {},
+                        .SetMeta => try daemon.handleSetMeta(client, msg.payload),
+                        .GetMeta => try daemon.handleGetMeta(client, msg.payload),
+                        .RemoveMeta => try daemon.handleRemoveMeta(client, msg.payload),
+                        .Output, .Ack, .Meta => {},
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},

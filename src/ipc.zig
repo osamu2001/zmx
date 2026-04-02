@@ -17,8 +17,12 @@ pub const Tag = enum(u8) {
     Ack = 10,
     Interrupt = 11,
     Signal = 12,
+    SetMeta = 13,
+    GetMeta = 14,
+    RemoveMeta = 15,
+    Meta = 16,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (13-255) are representable
+    // @enumFromInt, so out-of-range values (17-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -71,6 +75,11 @@ pub const SignalRequest = extern struct {
     signal: i32,
     scope: SignalScope,
     best_effort: u8,
+};
+
+pub const MetaStatus = enum(u8) {
+    ok = 0,
+    not_found = 1,
 };
 
 pub fn expectedLength(data: []const u8) ?usize {
