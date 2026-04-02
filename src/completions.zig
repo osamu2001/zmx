@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="create attach run detach info input send-keys set-meta get-meta remove-meta interrupt signal stop list completions kill history wait version help"
+    \\  local commands="create attach run detach info input send-keys set-meta get-meta remove-meta interrupt signal stop status list completions kill history wait version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,7 +37,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    create|attach|run|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|kill|history|wait)
+    \\    create|attach|run|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|status|kill|history|wait)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -107,6 +107,7 @@ const zsh_completions =
     \\        'interrupt:Send SIGINT to foreground process group'
     \\        'signal:Send a signal to foreground or session tree'
     \\        'stop:Gracefully stop a session'
+    \\        'status:Show operator-oriented health summary'
     \\        'list:List active sessions'
     \\        'completions:Shell completion scripts'
     \\        'kill:Kill a session'
@@ -119,7 +120,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        create|attach|a|kill|k|run|r|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|history|hi|wait|w)
+    \\        create|attach|a|kill|k|run|r|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|status|history|hi|wait|w)
     \\          _zmx_sessions
     \\          ;;
     \\        set-meta|get-meta)
@@ -187,6 +188,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'interrupt' -d 'Send SIGINT to foreground process group'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'signal' -d 'Send a signal to foreground or session tree'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'stop' -d 'Gracefully stop a session'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'status' -d 'Show operator-oriented health summary'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'l list' -d 'List active sessions'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'c completions' -d 'Shell completion scripts'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
@@ -270,6 +272,12 @@ test "completion scripts include stop command" {
     try std.testing.expect(std.mem.indexOf(u8, bash_completions, "stop") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "stop:Gracefully stop a session") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'stop' -d 'Gracefully stop a session'") != null);
+}
+
+test "completion scripts include status command" {
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "status:Show operator-oriented health summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'status' -d 'Show operator-oriented health summary'") != null);
 }
 
 test "completion scripts include list json flag" {

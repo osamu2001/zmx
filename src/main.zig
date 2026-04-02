@@ -288,6 +288,14 @@ fn realMain() !void {
         }
 
         return stop(&cfg, sesh, timeout_ms, escalate, best_effort);
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        const session_name = args.next();
+        const sesh = if (session_name) |name|
+            try socket.getSeshName(alloc, name)
+        else
+            null;
+        defer if (sesh) |name| alloc.free(name);
+        return status(&cfg, sesh);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         var short = false;
         var json = false;
@@ -1015,10 +1023,10 @@ const Daemon = struct {
         return payload.toOwnedSlice(self.alloc);
     }
 
-    fn appendMetaResponse(self: *Daemon, client: *Client, status: ipc.MetaStatus, json_payload: []const u8) !void {
+    fn appendMetaResponse(self: *Daemon, client: *Client, meta_status: ipc.MetaStatus, json_payload: []const u8) !void {
         var response = try std.ArrayList(u8).initCapacity(self.alloc, 1 + json_payload.len);
         defer response.deinit(self.alloc);
-        try response.append(self.alloc, @intFromEnum(status));
+        try response.append(self.alloc, @intFromEnum(meta_status));
         try response.appendSlice(self.alloc, json_payload);
         try ipc.appendMessage(self.alloc, &client.write_buf, .Meta, response.items);
         client.has_pending_output = true;
@@ -1299,11 +1307,11 @@ fn requestSessionMeta(
 
         while (sb.next()) |msg| {
             if (msg.header.tag != .Meta or msg.payload.len == 0) continue;
-            const status: ipc.MetaStatus = @enumFromInt(msg.payload[0]);
+            const meta_status: ipc.MetaStatus = @enumFromInt(msg.payload[0]);
             const json_payload = try alloc.dupe(u8, msg.payload[1..]);
             return .{
                 .json_payload = json_payload,
-                .found = status == .ok,
+                .found = meta_status == .ok,
             };
         }
     }
@@ -1329,6 +1337,7 @@ fn help() !void {
         \\  interrupt <name>               Send SIGINT to the foreground process group
         \\  signal <name> <sig>            Send a signal (--foreground|--session-tree, --best-effort)
         \\  stop <name>                    Gracefully stop a session (--timeout-ms, --escalate, --best-effort)
+        \\  status [name]                  Show operator-oriented health summary
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
@@ -1859,6 +1868,94 @@ fn stop(cfg: *Cfg, session_name: []const u8, timeout_ms: u64, escalate: bool, be
     }
 
     return error.Timeout;
+}
+
+fn status(cfg: *Cfg, session_name: ?[]const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var out_buf: [4096]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&out_buf);
+
+    if (session_name) |name| {
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, name) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(name, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer alloc.free(socket_path);
+
+        var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+        defer dir.close();
+
+        const exists = try socket.sessionExists(dir, name);
+        if (!exists) {
+            var errbuf: [4096]u8 = undefined;
+            var stderr = std.fs.File.stderr().writer(&errbuf);
+            stderr.interface.print("error: session \"{s}\" does not exist\n", .{name}) catch {};
+            stderr.interface.flush() catch {};
+            return error.SessionNotFound;
+        }
+
+        const result = ipc.probeSession(alloc, socket_path) catch |err| {
+            if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, name);
+            return err;
+        };
+        defer posix.close(result.fd);
+
+        const task_running = result.info.task_running != 0;
+        const state = stateForLiveSession(task_running, result.info.clients_len);
+        const health = healthForLiveSession(result.info.pid);
+        try out.interface.print(
+            "name={s} state={s} health={s} clients={d} pid={d}\n",
+            .{ name, state, health, result.info.clients_len, result.info.pid },
+        );
+        try out.interface.flush();
+        return;
+    }
+
+    var sessions = try util.get_session_entries(alloc, cfg.socket_dir);
+    defer {
+        for (sessions.items) |session| {
+            session.deinit(alloc);
+        }
+        sessions.deinit(alloc);
+    }
+
+    var healthy_count: usize = 0;
+    var degraded_count: usize = 0;
+    var unreachable_count: usize = 0;
+    var stale_socket_count: usize = 0;
+    var running_count: usize = 0;
+    var idle_count: usize = 0;
+    var task_running_count: usize = 0;
+    var failed_count: usize = 0;
+    var orphaned_count: usize = 0;
+
+    for (sessions.items) |session| {
+        const health = listHealth(session);
+        if (std.mem.eql(u8, health, "healthy")) healthy_count += 1;
+        if (std.mem.eql(u8, health, "degraded")) degraded_count += 1;
+        if (std.mem.eql(u8, health, "unreachable")) unreachable_count += 1;
+        if (std.mem.eql(u8, health, "stale-socket")) stale_socket_count += 1;
+
+        const state = listState(session);
+        if (std.mem.eql(u8, state, "running")) running_count += 1;
+        if (std.mem.eql(u8, state, "idle")) idle_count += 1;
+        if (std.mem.eql(u8, state, "task-running")) task_running_count += 1;
+        if (std.mem.eql(u8, state, "failed")) failed_count += 1;
+        if (std.mem.eql(u8, state, "orphaned")) orphaned_count += 1;
+    }
+
+    try out.interface.print(
+        "runtime total={d} healthy={d} degraded={d} unreachable={d} stale-socket={d}\n",
+        .{ sessions.items.len, healthy_count, degraded_count, unreachable_count, stale_socket_count },
+    );
+    try out.interface.print(
+        "states running={d} idle={d} task-running={d} failed={d} orphaned={d}\n",
+        .{ running_count, idle_count, task_running_count, failed_count, orphaned_count },
+    );
+    try out.interface.flush();
 }
 
 fn isSessionReady(session_info: ipc.Info, level: ReadinessLevel) bool {
