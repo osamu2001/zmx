@@ -1423,7 +1423,8 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
         @as(?u8, result.info.task_exit_code)
     else
         null;
-    const state: []const u8 = if (task_running) "task-running" else "running";
+    const state = stateForLiveSession(task_running, result.info.clients_len);
+    const health = healthForLiveSession(result.info.pid);
 
     if (json) {
         var out_buf: [4096]u8 = undefined;
@@ -1432,7 +1433,8 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
         try out.interface.writeByte('{');
         try writeJsonField(&out.interface, &first, "name", session_name);
         try writeJsonField(&out.interface, &first, "state", state);
-        try writeJsonField(&out.interface, &first, "healthy", true);
+        try writeJsonField(&out.interface, &first, "health", health);
+        try writeJsonField(&out.interface, &first, "healthy", std.mem.eql(u8, health, "healthy"));
         try writeJsonField(&out.interface, &first, "pid", result.info.pid);
         try writeJsonField(&out.interface, &first, "clients", result.info.clients_len);
         try writeJsonField(&out.interface, &first, "cmd", cmd);
@@ -1457,7 +1459,8 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
     var out = std.fs.File.stdout().writer(&out_buf);
     try out.interface.print("name={s}\n", .{session_name});
     try out.interface.print("state={s}\n", .{state});
-    try out.interface.print("healthy=true\n", .{});
+    try out.interface.print("health={s}\n", .{health});
+    try out.interface.print("healthy={s}\n", .{if (std.mem.eql(u8, health, "healthy")) "true" else "false"});
     try out.interface.print("pid={d}\n", .{result.info.pid});
     try out.interface.print("clients={d}\n", .{result.info.clients_len});
     try out.interface.print("created_at={s}\n", .{created_at});
@@ -2082,6 +2085,7 @@ const ListJsonEntry = struct {
     socket_path: []const u8,
     state: []const u8,
     status: []const u8,
+    health: []const u8,
     healthy: bool,
     is_current: bool,
     pid: ?i32,
@@ -2097,10 +2101,35 @@ const ListJsonEntry = struct {
     @"error": ?ListJsonError,
 };
 
-fn listState(session: util.SessionEntry) []const u8 {
-    if (session.is_error) return "unreachable";
-    if (session.is_task_mode and session.task_running) return "task-running";
+fn stateForLiveSession(task_running: bool, clients_len: usize) []const u8 {
+    if (task_running) return "task-running";
+    if (clients_len == 0) return "idle";
     return "running";
+}
+
+fn healthForLiveSession(pid: i32) []const u8 {
+    if (pid > 0) return "healthy";
+    return "degraded";
+}
+
+fn listState(session: util.SessionEntry) []const u8 {
+    if (session.is_error) {
+        const health = listHealth(session);
+        if (std.mem.eql(u8, health, "stale-socket")) return "orphaned";
+        return "failed";
+    }
+    return stateForLiveSession(session.is_task_mode and session.task_running, session.clients_len orelse 0);
+}
+
+fn listHealth(session: util.SessionEntry) []const u8 {
+    if (!session.is_error) {
+        return healthForLiveSession(session.pid orelse 0);
+    }
+    if (session.error_name) |name| {
+        if (std.mem.eql(u8, name, "ConnectionRefused")) return "stale-socket";
+        if (std.mem.eql(u8, name, "Timeout")) return "degraded";
+    }
+    return "unreachable";
 }
 
 fn listStatus(session: util.SessionEntry) []const u8 {
@@ -2163,7 +2192,8 @@ fn writeListJsonEntry(
         .socket_path = socket_path,
         .state = listState(session),
         .status = listStatus(session),
-        .healthy = !session.is_error,
+        .health = listHealth(session),
+        .healthy = std.mem.eql(u8, listHealth(session), "healthy"),
         .is_current = is_current,
         .pid = session.pid,
         .clients = session.clients_len,
@@ -2609,7 +2639,7 @@ test "formatTimestampUtc formats epoch seconds as RFC3339 UTC" {
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", formatted);
 }
 
-test "list helpers derive stable state and status" {
+test "list helpers derive stable state and health" {
     const running = util.SessionEntry{
         .name = "task",
         .pid = 42,
@@ -2629,7 +2659,29 @@ test "list helpers derive stable state and status" {
         .task_exit_code = null,
     };
     try std.testing.expectEqualStrings("task-running", listState(running));
+    try std.testing.expectEqualStrings("healthy", listHealth(running));
     try std.testing.expectEqualStrings("ok", listStatus(running));
+
+    const idle = util.SessionEntry{
+        .name = "idle",
+        .pid = 42,
+        .clients_len = 0,
+        .is_error = false,
+        .error_name = null,
+        .is_task_mode = false,
+        .task_running = false,
+        .cmd = null,
+        .cwd = null,
+        .created_at = 0,
+        .last_activity_at = null,
+        .last_output_at = null,
+        .last_input_at = null,
+        .last_client_attach_at = null,
+        .task_ended_at = null,
+        .task_exit_code = null,
+    };
+    try std.testing.expectEqualStrings("idle", listState(idle));
+    try std.testing.expectEqualStrings("healthy", listHealth(idle));
 
     const unreachable_session = util.SessionEntry{
         .name = "stale",
@@ -2649,7 +2701,8 @@ test "list helpers derive stable state and status" {
         .task_ended_at = 0,
         .task_exit_code = 1,
     };
-    try std.testing.expectEqualStrings("unreachable", listState(unreachable_session));
+    try std.testing.expectEqualStrings("orphaned", listState(unreachable_session));
+    try std.testing.expectEqualStrings("stale-socket", listHealth(unreachable_session));
     try std.testing.expectEqualStrings("cleaning-up", listStatus(unreachable_session));
 }
 
