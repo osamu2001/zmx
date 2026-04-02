@@ -46,6 +46,17 @@ const ExitCode = enum(u8) {
     unsupported = 6,
 };
 
+const WaitTarget = enum {
+    task_exit,
+    session_exit,
+    ready,
+};
+
+const ReadinessLevel = enum {
+    daemon_ready,
+    session_ready,
+};
+
 fn currentTimestamp() u64 {
     return @intCast(std.time.timestamp());
 }
@@ -357,11 +368,25 @@ fn realMain() !void {
             }
             args_raw.deinit(alloc);
         }
-        while (args.next()) |session_name| {
+        var target: WaitTarget = .task_exit;
+        var timeout_ms: ?u64 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--for")) {
+                const value = args.next() orelse return error.CommandRequired;
+                target = try parseWaitTarget(value);
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--timeout")) {
+                const value = args.next() orelse return error.CommandRequired;
+                timeout_ms = try parseDurationMillis(value);
+                continue;
+            }
+
+            const session_name = arg;
             const sesh = try socket.getSeshName(alloc, session_name);
             try args_raw.append(alloc, sesh);
         }
-        return wait(&cfg, args_raw);
+        return wait(&cfg, args_raw, target, timeout_ms);
     } else {
         return help();
     }
@@ -725,7 +750,10 @@ const Daemon = struct {
                 return .{ .created = true, .is_daemon = true };
             }
             posix.close(server_sock_fd);
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            waitForSessionReadiness(self.cfg, self.session_name, .session_ready, 2000) catch |err| switch (err) {
+                error.SessionNotReady => return err,
+                else => return err,
+            };
             return .{ .created = true, .is_daemon = false };
         }
 
@@ -1304,7 +1332,7 @@ fn help() !void {
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
-        \\  [w]ait <name>...               Wait for session tasks to complete
+        \\  [w]ait <name>...               Wait for readiness or exit (--for, --timeout)
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
         \\  [v]ersion                      Show version information
         \\  [h]elp                         Show this help message
@@ -1552,6 +1580,26 @@ fn parseSignalName(name: []const u8) !i32 {
     if (std.ascii.eqlIgnoreCase(name, "usr2") or std.ascii.eqlIgnoreCase(name, "sigusr2")) return posix.SIG.USR2;
 
     return std.fmt.parseInt(i32, name, 10) catch error.UnsupportedSignal;
+}
+
+fn parseWaitTarget(name: []const u8) !WaitTarget {
+    if (std.mem.eql(u8, name, "task-exit")) return .task_exit;
+    if (std.mem.eql(u8, name, "session-exit")) return .session_exit;
+    if (std.mem.eql(u8, name, "ready")) return .ready;
+    return error.CommandRequired;
+}
+
+fn parseDurationMillis(value: []const u8) !u64 {
+    if (std.mem.endsWith(u8, value, "ms")) {
+        return std.fmt.parseInt(u64, value[0 .. value.len - 2], 10);
+    }
+    if (std.mem.endsWith(u8, value, "s")) {
+        return try std.math.mul(u64, try std.fmt.parseInt(u64, value[0 .. value.len - 1], 10), 1000);
+    }
+    if (std.mem.endsWith(u8, value, "m")) {
+        return try std.math.mul(u64, try std.fmt.parseInt(u64, value[0 .. value.len - 1], 10), 60_000);
+    }
+    return std.fmt.parseInt(u64, value, 10);
 }
 
 fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success_message: []const u8) !void {
@@ -1810,7 +1858,62 @@ fn stop(cfg: *Cfg, session_name: []const u8, timeout_ms: u64, escalate: bool, be
     return error.Timeout;
 }
 
-fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
+fn isSessionReady(session_info: ipc.Info, level: ReadinessLevel) bool {
+    return switch (level) {
+        .daemon_ready => true,
+        .session_ready => session_info.pid > 0,
+    };
+}
+
+fn sessionEntryReady(session: util.SessionEntry) bool {
+    return !session.is_error and session.pid != null and session.pid.? > 0;
+}
+
+fn waitForSessionReadiness(cfg: *Cfg, session_name: []const u8, level: ReadinessLevel, timeout_ms: u64) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+        defer dir.close();
+
+        const exists = try socket.sessionExists(dir, session_name);
+        if (exists) {
+            const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+                error.NameTooLong => {
+                    socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+                    return error.NameTooLong;
+                },
+                error.OutOfMemory => return err,
+            };
+            defer alloc.free(socket_path);
+
+            const result = ipc.probeSession(alloc, socket_path) catch |err| switch (err) {
+                error.ConnectionRefused => {
+                    socket.cleanupStaleSocket(dir, session_name);
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    continue;
+                },
+                error.Timeout => {
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            defer posix.close(result.fd);
+
+            if (isSessionReady(result.info, level)) return;
+        }
+
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    return error.SessionNotReady;
+}
+
+fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget, timeout_ms: ?u64) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1828,8 +1931,25 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
     // disappeared" (fail -- daemon crashed or was killed).
     var max_seen: i32 = 0;
     var zero_match_iters: u32 = 0;
+    const deadline = if (timeout_ms) |value|
+        std.time.milliTimestamp() + @as(i64, @intCast(value))
+    else
+        null;
+    const target_label = switch (target) {
+        .task_exit => "task-exit",
+        .session_exit => "session-exit",
+        .ready => "ready",
+    };
 
     while (true) {
+        if (deadline) |limit| {
+            if (std.time.milliTimestamp() >= limit) {
+                try stderr.print("error: timed out waiting for {s}\n", .{target_label});
+                try stderr.flush();
+                return error.Timeout;
+            }
+        }
+
         var sessions = try util.get_session_entries(alloc, cfg.socket_dir);
         var total: i32 = 0;
         var done: i32 = 0;
@@ -1848,29 +1968,41 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
             }
 
             total += 1;
-            if (session.is_error) {
-                // Daemon unreachable (probe timed out). On Timeout the socket
-                // is no longer deleted, so this session would otherwise
-                // persist as task_ended_at==0 forever → infinite "still
-                // waiting". Count it as done+failed so wait terminates.
-                try stderr.print(
-                    "task unreachable: {s} ({s})\n",
-                    .{ session.name, session.error_name orelse "unknown" },
-                );
-                try stderr.flush();
-                agg_exit_code = 1;
-                done += 1;
-                continue;
+            switch (target) {
+                .task_exit => {
+                    if (session.is_error) {
+                        try stderr.print(
+                            "task unreachable: {s} ({s})\n",
+                            .{ session.name, session.error_name orelse "unknown" },
+                        );
+                        try stderr.flush();
+                        agg_exit_code = 1;
+                        done += 1;
+                        continue;
+                    }
+                    if (session.task_ended_at == 0) {
+                        try stdout.print("still waiting task={s}\n", .{session.name});
+                        try stdout.flush();
+                        continue;
+                    }
+                    if (session.task_exit_code != 0) {
+                        agg_exit_code = session.task_exit_code orelse 0;
+                    }
+                    done += 1;
+                },
+                .ready => {
+                    if (sessionEntryReady(session)) {
+                        done += 1;
+                    } else {
+                        try stdout.print("still waiting ready={s}\n", .{session.name});
+                        try stdout.flush();
+                    }
+                },
+                .session_exit => {
+                    try stdout.print("still waiting session={s}\n", .{session.name});
+                    try stdout.flush();
+                },
             }
-            if (session.task_ended_at == 0) {
-                try stdout.print("still waiting task={s}\n", .{session.name});
-                try stdout.flush();
-                continue;
-            }
-            if (session.task_exit_code != 0) {
-                agg_exit_code = session.task_exit_code orelse 0;
-            }
-            done += 1;
         }
 
         for (sessions.items) |session| {
@@ -1878,25 +2010,41 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
         }
         sessions.deinit(alloc);
 
-        // Check disappearance BEFORE completion: if one of N sessions
-        // crashed and the remaining N-1 happen to be done, total==done
-        // would be a false success.
-        if (total < max_seen) {
-            try stderr.print(
-                "error: {d} session(s) disappeared before completing\n",
-                .{max_seen - total},
-            );
-            try stderr.flush();
-            std.process.exit(1);
-            return;
-        }
-        max_seen = total;
+        if (target == .session_exit) {
+            if (total > max_seen) max_seen = total;
+            if (max_seen > 0 and total == 0) {
+                try stdout.print("sessions exited\n", .{});
+                try stdout.flush();
+                return;
+            }
+        } else {
+            // Check disappearance BEFORE completion: if one of N sessions
+            // crashed and the remaining N-1 happen to be done, total==done
+            // would be a false success.
+            if (total < max_seen) {
+                try stderr.print(
+                    "error: {d} session(s) disappeared before completing\n",
+                    .{max_seen - total},
+                );
+                try stderr.flush();
+                std.process.exit(1);
+                return;
+            }
+            max_seen = total;
 
-        if (total > 0 and total == done) {
-            try stdout.print("tasks completed!\n", .{});
-            try stdout.flush();
-            std.process.exit(agg_exit_code);
-            return;
+            if (total > 0 and total == done) {
+                const success_message = switch (target) {
+                    .task_exit => "tasks completed!",
+                    .ready => "sessions ready",
+                    .session_exit => unreachable,
+                };
+                try stdout.print("{s}\n", .{success_message});
+                try stdout.flush();
+                if (target == .task_exit and agg_exit_code != 0) {
+                    std.process.exit(agg_exit_code);
+                }
+                return;
+            }
         }
 
         if (max_seen == 0) {
@@ -2539,6 +2687,19 @@ test "parseSignalName accepts symbolic and numeric forms" {
     try std.testing.expectError(error.UnsupportedSignal, parseSignalName("banana"));
 }
 
+test "parseWaitTarget accepts supported targets" {
+    try std.testing.expectEqual(WaitTarget.ready, try parseWaitTarget("ready"));
+    try std.testing.expectEqual(WaitTarget.task_exit, try parseWaitTarget("task-exit"));
+    try std.testing.expectEqual(WaitTarget.session_exit, try parseWaitTarget("session-exit"));
+}
+
+test "parseDurationMillis accepts basic suffixes" {
+    try std.testing.expectEqual(@as(u64, 500), try parseDurationMillis("500ms"));
+    try std.testing.expectEqual(@as(u64, 2000), try parseDurationMillis("2s"));
+    try std.testing.expectEqual(@as(u64, 60_000), try parseDurationMillis("1m"));
+    try std.testing.expectEqual(@as(u64, 250), try parseDurationMillis("250"));
+}
+
 test "buildMetaValueJson stringifies plain text and canonicalizes json" {
     const alloc = std.testing.allocator;
 
@@ -2597,6 +2758,7 @@ fn clientLoop(client_sock_fd: i32) !void {
     defer stdout_buf.deinit(alloc);
 
     const stdin_fd = posix.STDIN_FILENO;
+    var stdin_closed = false;
 
     // Make stdin non-blocking. O_NONBLOCK is set on the open file description,
     // which is shared with the parent shell; restore on exit to avoid
@@ -2614,11 +2776,13 @@ fn clientLoop(client_sock_fd: i32) !void {
 
         poll_fds.clearRetainingCapacity();
 
-        try poll_fds.append(alloc, .{
-            .fd = stdin_fd,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        });
+        if (!stdin_closed) {
+            try poll_fds.append(alloc, .{
+                .fd = stdin_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            });
+        }
 
         // Poll socket for read, and also for write if we have pending data
         var sock_events: i16 = posix.POLL.IN;
@@ -2645,31 +2809,39 @@ fn clientLoop(client_sock_fd: i32) !void {
         };
 
         // Handle stdin -> socket (Input)
-        const inp_flags = (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL);
-        if (poll_fds.items[0].revents & inp_flags != 0) {
-            var buf: [4096]u8 = undefined;
-            const n_opt: ?usize = posix.read(stdin_fd, &buf) catch |err| blk: {
-                if (err == error.WouldBlock) break :blk null;
-                return err;
-            };
+        const stdin_index: ?usize = if (!stdin_closed) 0 else null;
+        const socket_index: usize = if (!stdin_closed) 1 else 0;
+        const stdout_index: ?usize = if (stdout_buf.items.len > 0)
+            if (!stdin_closed) 2 else 1
+        else
+            null;
 
-            if (n_opt) |n| {
-                if (n > 0) {
-                    // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
-                    if (buf[0] == 0x1C or util.isKittyCtrlBackslash(buf[0..n])) {
-                        try ipc.appendMessage(alloc, &sock_write_buf, .Detach, "");
+        const inp_flags = (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL);
+        if (stdin_index) |index| {
+            if (poll_fds.items[index].revents & inp_flags != 0) {
+                var buf: [4096]u8 = undefined;
+                const n_opt: ?usize = posix.read(stdin_fd, &buf) catch |err| blk: {
+                    if (err == error.WouldBlock) break :blk null;
+                    return err;
+                };
+
+                if (n_opt) |n| {
+                    if (n > 0) {
+                        // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
+                        if (buf[0] == 0x1C or util.isKittyCtrlBackslash(buf[0..n])) {
+                            try ipc.appendMessage(alloc, &sock_write_buf, .Detach, "");
+                        } else {
+                            try ipc.appendMessage(alloc, &sock_write_buf, .Input, buf[0..n]);
+                        }
                     } else {
-                        try ipc.appendMessage(alloc, &sock_write_buf, .Input, buf[0..n]);
+                        stdin_closed = true;
                     }
-                } else {
-                    // EOF on stdin
-                    return;
                 }
             }
         }
 
         // Handle socket read (incoming Output messages from daemon)
-        if (poll_fds.items[1].revents & posix.POLL.IN != 0) {
+        if (poll_fds.items[socket_index].revents & posix.POLL.IN != 0) {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
@@ -2696,7 +2868,7 @@ fn clientLoop(client_sock_fd: i32) !void {
         }
 
         // Handle socket write (flush buffered messages to daemon)
-        if (poll_fds.items[1].revents & posix.POLL.OUT != 0) {
+        if (poll_fds.items[socket_index].revents & posix.POLL.OUT != 0) {
             if (sock_write_buf.items.len > 0) {
                 const n = posix.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
@@ -2711,7 +2883,7 @@ fn clientLoop(client_sock_fd: i32) !void {
             }
         }
 
-        if (stdout_buf.items.len > 0) {
+        if (stdout_index != null) {
             const n = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk 0;
                 return err;
@@ -2721,7 +2893,11 @@ fn clientLoop(client_sock_fd: i32) !void {
             }
         }
 
-        if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+        if (stdin_closed and sock_write_buf.items.len == 0 and stdout_buf.items.len == 0) {
+            return;
+        }
+
+        if (poll_fds.items[socket_index].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
             return;
         }
     }
@@ -2804,9 +2980,6 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             };
             client.write_buf = try std.ArrayList(u8).initCapacity(client.alloc, 4096);
             try daemon.clients.append(daemon.alloc, client);
-            const now = currentTimestamp();
-            daemon.last_client_attach_at = now;
-            daemon.last_activity_at = now;
             std.log.info(
                 "client connected fd={d} total={d}",
                 .{ client_fd, daemon.clients.items.len },

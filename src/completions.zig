@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="create attach run detach info input send-keys set-meta get-meta remove-meta interrupt signal stop list completions kill history version help"
+    \\  local commands="create attach run detach info input send-keys set-meta get-meta remove-meta interrupt signal stop list completions kill history wait version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,7 +37,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    create|attach|run|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|kill|history)
+    \\    create|attach|run|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|kill|history|wait)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -64,6 +64,9 @@ const bash_completions =
     \\      ;;
     \\    stop)
     \\      COMPREPLY=($(compgen -W "--timeout-ms --escalate --best-effort" -- "$cur"))
+    \\      ;;
+    \\    wait)
+    \\      COMPREPLY=($(compgen -W "--for --timeout ready task-exit session-exit" -- "$cur"))
     \\      ;;
     \\    list)
     \\      COMPREPLY=($(compgen -W "--short --json" -- "$cur"))
@@ -108,6 +111,7 @@ const zsh_completions =
     \\        'completions:Shell completion scripts'
     \\        'kill:Kill a session'
     \\        'history:Output session scrollback'
+    \\        'wait:Wait for readiness or exit'
     \\        'version:Show version'
     \\        'help:Show help message'
     \\      )
@@ -115,7 +119,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        create|attach|a|kill|k|run|r|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|history|hi)
+    \\        create|attach|a|kill|k|run|r|info|input|send-keys|set-meta|get-meta|remove-meta|interrupt|signal|stop|history|hi|wait|w)
     \\          _zmx_sessions
     \\          ;;
     \\        set-meta|get-meta)
@@ -138,6 +142,9 @@ const zsh_completions =
     \\          ;;
     \\        stop)
     \\          _values 'options' '--timeout-ms' '--escalate' '--best-effort'
+    \\          ;;
+    \\        wait|w)
+    \\          _values 'options' '--for' '--timeout' 'ready' 'task-exit' 'session-exit'
     \\          ;;
     \\        list|l)
     \\          _values 'options' '--short' '--json'
@@ -186,7 +193,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'hi history' -d 'Output session scrollback'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'v version' -d 'Show version'
     \\complete -c zmx -s v -l version -d 'Show version'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for session tasks to complete'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for readiness or exit'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
     \\complete -c zmx -s h -d 'Show help message'
     \\
@@ -207,6 +214,9 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from stop" -l timeout-ms -d 'Graceful shutdown timeout in milliseconds'
     \\complete -c zmx -n "__fish_seen_subcommand_from stop" -l escalate -d 'Escalate to SIGKILL after timeout'
     \\complete -c zmx -n "__fish_seen_subcommand_from stop" -l best-effort -d 'Ignore missing target'
+    \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -l for -d 'Wait target'
+    \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -l timeout -d 'Wait timeout (e.g. 500ms, 2s)'
+    \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -a 'ready task-exit session-exit' -d 'Wait target'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l json -d 'JSON output'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
