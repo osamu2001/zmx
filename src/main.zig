@@ -210,6 +210,26 @@ fn realMain() !void {
             return err;
         };
         return signalSession(&cfg, sesh, sig, scope, best_effort, "signal sent");
+    } else if (std.mem.eql(u8, cmd, "stop")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        var best_effort = false;
+        var escalate = false;
+        var timeout_ms: u64 = 2000;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--best-effort")) {
+                best_effort = true;
+            } else if (std.mem.eql(u8, arg, "--escalate")) {
+                escalate = true;
+            } else if (std.mem.eql(u8, arg, "--timeout-ms")) {
+                const value = args.next() orelse return error.CommandRequired;
+                timeout_ms = try std.fmt.parseInt(u64, value, 10);
+            }
+        }
+
+        return stop(&cfg, sesh, timeout_ms, escalate, best_effort);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         var short = false;
         var json = false;
@@ -991,6 +1011,7 @@ fn help() !void {
         \\  send-keys <name> <keys...>     Send special keys without attaching (enter/escape/ctrl-c/arrows)
         \\  interrupt <name>               Send SIGINT to the foreground process group
         \\  signal <name> <sig>            Send a signal (--foreground|--session-tree, --best-effort)
+        \\  stop <name>                    Gracefully stop a session (--timeout-ms, --escalate, --best-effort)
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
@@ -1291,24 +1312,22 @@ fn signalSession(
 ) !void {
     if (signal_number == posix.SIG.INT and scope == .foreground) {
         const payload = [_]u8{@intFromBool(best_effort)};
-        return signalSessionWithTag(cfg, session_name, .Interrupt, &payload, success_message);
+        try dispatchSessionControl(cfg, session_name, .Interrupt, &payload);
+    } else {
+        var request = ipc.SignalRequest{
+            .signal = signal_number,
+            .scope = scope,
+            .best_effort = @intFromBool(best_effort),
+        };
+        try dispatchSessionControl(cfg, session_name, .Signal, std.mem.asBytes(&request));
     }
-
-    var request = ipc.SignalRequest{
-        .signal = signal_number,
-        .scope = scope,
-        .best_effort = @intFromBool(best_effort),
-    };
-    return signalSessionWithTag(cfg, session_name, .Signal, std.mem.asBytes(&request), success_message);
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("{s}\n", .{success_message});
+    try w.interface.flush();
 }
 
-fn signalSessionWithTag(
-    cfg: *Cfg,
-    session_name: []const u8,
-    tag: ipc.Tag,
-    payload: []const u8,
-    success_message: []const u8,
-) !void {
+fn dispatchSessionControl(cfg: *Cfg, session_name: []const u8, tag: ipc.Tag, payload: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1342,11 +1361,100 @@ fn signalSessionWithTag(
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
+}
 
-    var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("{s}\n", .{success_message});
-    try w.interface.flush();
+fn waitForSessionExit(cfg: *Cfg, session_name: []const u8, timeout_ms: u64) !bool {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const CheckError = error{ SessionGone, StaleSocket };
+    const checkGone = struct {
+        fn run(alloc_inner: std.mem.Allocator, cfg_inner: *Cfg, session_name_inner: []const u8) !void {
+            var dir = try std.fs.openDirAbsolute(cfg_inner.socket_dir, .{});
+            defer dir.close();
+
+            const exists = try socket.sessionExists(dir, session_name_inner);
+            if (!exists) return CheckError.SessionGone;
+
+            const socket_path = socket.getSocketPath(alloc_inner, cfg_inner.socket_dir, session_name_inner) catch |err| switch (err) {
+                error.NameTooLong => return error.NameTooLong,
+                error.OutOfMemory => return err,
+            };
+            defer alloc_inner.free(socket_path);
+
+            _ = ipc.probeSession(alloc_inner, socket_path) catch |err| switch (err) {
+                error.ConnectionRefused => {
+                    socket.cleanupStaleSocket(dir, session_name_inner);
+                    return CheckError.StaleSocket;
+                },
+                else => return,
+            };
+        }
+    }.run;
+
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        checkGone(alloc, cfg, session_name) catch |err| switch (err) {
+            CheckError.SessionGone, CheckError.StaleSocket => return true,
+            else => return err,
+        };
+
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
+    checkGone(alloc, cfg, session_name) catch |err| switch (err) {
+        CheckError.SessionGone, CheckError.StaleSocket => return true,
+        else => return err,
+    };
+    return false;
+}
+
+fn stop(cfg: *Cfg, session_name: []const u8, timeout_ms: u64, escalate: bool, best_effort: bool) !void {
+    if (best_effort) {
+        var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+        defer dir.close();
+        const exists = try socket.sessionExists(dir, session_name);
+        if (!exists) {
+            var buf: [4096]u8 = undefined;
+            var w = std.fs.File.stdout().writer(&buf);
+            try w.interface.print("session already stopped\n", .{});
+            try w.interface.flush();
+            return;
+        }
+    }
+
+    var term_request = ipc.SignalRequest{
+        .signal = posix.SIG.TERM,
+        .scope = .session_tree,
+        .best_effort = @intFromBool(best_effort),
+    };
+    try dispatchSessionControl(cfg, session_name, .Signal, std.mem.asBytes(&term_request));
+    if (try waitForSessionExit(cfg, session_name, @max(timeout_ms, 1000))) {
+        var buf: [4096]u8 = undefined;
+        var w = std.fs.File.stdout().writer(&buf);
+        try w.interface.print("session stopped\n", .{});
+        try w.interface.flush();
+        return;
+    }
+
+    if (!escalate) return error.Timeout;
+
+    var kill_request = ipc.SignalRequest{
+        .signal = posix.SIG.KILL,
+        .scope = .session_tree,
+        .best_effort = @intFromBool(best_effort),
+    };
+    try dispatchSessionControl(cfg, session_name, .Signal, std.mem.asBytes(&kill_request));
+    if (try waitForSessionExit(cfg, session_name, timeout_ms)) {
+        var buf: [4096]u8 = undefined;
+        var w = std.fs.File.stdout().writer(&buf);
+        try w.interface.print("session stopped\n", .{});
+        try w.interface.flush();
+        return;
+    }
+
+    return error.Timeout;
 }
 
 fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
