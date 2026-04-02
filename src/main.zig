@@ -56,8 +56,10 @@ fn exitCodeForError(err: anyerror) u8 {
         error.FileNotUnixSocket,
         error.CommandRequired,
         error.InvalidKeyName,
+        error.UnsupportedSignal,
         error.CannotAttachToSessionInSession,
         => @intFromEnum(ExitCode.usage_error),
+        error.UnsupportedSignalTarget => @intFromEnum(ExitCode.unsupported),
         else => @intFromEnum(ExitCode.operational_failure),
     };
 }
@@ -169,6 +171,45 @@ fn realMain() !void {
         const payload = try buildSendKeysPayload(alloc, keys.items);
         defer alloc.free(payload);
         return sendPayload(&cfg, sesh, payload, "keys sent");
+    } else if (std.mem.eql(u8, cmd, "interrupt")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        var best_effort = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--best-effort")) {
+                best_effort = true;
+            }
+        }
+        return signalSession(&cfg, sesh, posix.SIG.INT, .foreground, best_effort, "interrupt sent");
+    } else if (std.mem.eql(u8, cmd, "signal")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        const signal_name = args.next() orelse return error.CommandRequired;
+        var scope: ipc.SignalScope = .foreground;
+        var best_effort = false;
+
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--best-effort")) {
+                best_effort = true;
+            } else if (std.mem.eql(u8, arg, "--session-tree")) {
+                scope = .session_tree;
+            } else if (std.mem.eql(u8, arg, "--foreground")) {
+                scope = .foreground;
+            }
+        }
+
+        const sig = parseSignalName(signal_name) catch |err| {
+            var buf: [256]u8 = undefined;
+            var w = std.fs.File.stderr().writer(&buf);
+            w.interface.print("error: unsupported signal \"{s}\"\n", .{signal_name}) catch {};
+            w.interface.flush() catch {};
+            return err;
+        };
+        return signalSession(&cfg, sesh, sig, scope, best_effort, "signal sent");
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         var short = false;
         var json = false;
@@ -839,6 +880,44 @@ const Daemon = struct {
         self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
     }
+
+    fn sendSignalToTarget(
+        self: *Daemon,
+        pty_fd: i32,
+        signal_number: i32,
+        scope: ipc.SignalScope,
+        best_effort: bool,
+    ) !void {
+        const target: i32 = switch (scope) {
+            .foreground => blk: {
+                const pgid = cross.c.tcgetpgrp(pty_fd);
+                if (pgid <= 0) {
+                    if (best_effort) return;
+                    return error.UnsupportedSignalTarget;
+                }
+                break :blk -@as(i32, @intCast(pgid));
+            },
+            .session_tree => -self.pid,
+        };
+
+        posix.kill(target, @as(u8, @intCast(signal_number))) catch |err| switch (err) {
+            error.ProcessNotFound => {
+                if (!best_effort) return err;
+            },
+            else => return err,
+        };
+    }
+
+    pub fn handleInterrupt(self: *Daemon, pty_fd: i32, payload: []const u8) !void {
+        const best_effort = payload.len > 0 and payload[0] != 0;
+        try self.sendSignalToTarget(pty_fd, posix.SIG.INT, .foreground, best_effort);
+    }
+
+    pub fn handleSignal(self: *Daemon, pty_fd: i32, payload: []const u8) !void {
+        if (payload.len != @sizeOf(ipc.SignalRequest)) return;
+        const request = std.mem.bytesToValue(ipc.SignalRequest, payload);
+        try self.sendSignalToTarget(pty_fd, request.signal, request.scope, request.best_effort != 0);
+    }
 };
 
 fn printVersion(cfg: *Cfg) !void {
@@ -910,6 +989,8 @@ fn help() !void {
         \\  info <name> [--json]           Show session details
         \\  input <name> [text...]         Send text input without attaching (--stdin/--enter/--no-newline)
         \\  send-keys <name> <keys...>     Send special keys without attaching (enter/escape/ctrl-c/arrows)
+        \\  interrupt <name>               Send SIGINT to the foreground process group
+        \\  signal <name> <sig>            Send a signal (--foreground|--session-tree, --best-effort)
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
@@ -1147,6 +1228,18 @@ fn buildSendKeysPayload(alloc: std.mem.Allocator, keys: []const []const u8) ![]u
     return payload.toOwnedSlice(alloc);
 }
 
+fn parseSignalName(name: []const u8) !i32 {
+    if (std.ascii.eqlIgnoreCase(name, "int") or std.ascii.eqlIgnoreCase(name, "sigint")) return posix.SIG.INT;
+    if (std.ascii.eqlIgnoreCase(name, "term") or std.ascii.eqlIgnoreCase(name, "sigterm")) return posix.SIG.TERM;
+    if (std.ascii.eqlIgnoreCase(name, "hup") or std.ascii.eqlIgnoreCase(name, "sighup")) return posix.SIG.HUP;
+    if (std.ascii.eqlIgnoreCase(name, "kill") or std.ascii.eqlIgnoreCase(name, "sigkill")) return posix.SIG.KILL;
+    if (std.ascii.eqlIgnoreCase(name, "quit") or std.ascii.eqlIgnoreCase(name, "sigquit")) return posix.SIG.QUIT;
+    if (std.ascii.eqlIgnoreCase(name, "usr1") or std.ascii.eqlIgnoreCase(name, "sigusr1")) return posix.SIG.USR1;
+    if (std.ascii.eqlIgnoreCase(name, "usr2") or std.ascii.eqlIgnoreCase(name, "sigusr2")) return posix.SIG.USR2;
+
+    return std.fmt.parseInt(i32, name, 10) catch error.UnsupportedSignal;
+}
+
 fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success_message: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1178,6 +1271,74 @@ fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success
     defer posix.close(result.fd);
 
     ipc.send(result.fd, .Input, payload) catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return,
+        else => return err,
+    };
+
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("{s}\n", .{success_message});
+    try w.interface.flush();
+}
+
+fn signalSession(
+    cfg: *Cfg,
+    session_name: []const u8,
+    signal_number: i32,
+    scope: ipc.SignalScope,
+    best_effort: bool,
+    success_message: []const u8,
+) !void {
+    if (signal_number == posix.SIG.INT and scope == .foreground) {
+        const payload = [_]u8{@intFromBool(best_effort)};
+        return signalSessionWithTag(cfg, session_name, .Interrupt, &payload, success_message);
+    }
+
+    var request = ipc.SignalRequest{
+        .signal = signal_number,
+        .scope = scope,
+        .best_effort = @intFromBool(best_effort),
+    };
+    return signalSessionWithTag(cfg, session_name, .Signal, std.mem.asBytes(&request), success_message);
+}
+
+fn signalSessionWithTag(
+    cfg: *Cfg,
+    session_name: []const u8,
+    tag: ipc.Tag,
+    payload: []const u8,
+    success_message: []const u8,
+) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.OutOfMemory => return err,
+    };
+    defer alloc.free(socket_path);
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, session_name);
+    if (!exists) {
+        var buf: [4096]u8 = undefined;
+        var w = std.fs.File.stderr().writer(&buf);
+        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
+        w.interface.flush() catch {};
+        return error.SessionNotFound;
+    }
+
+    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
+        return err;
+    };
+    defer posix.close(result.fd);
+
+    ipc.send(result.fd, tag, payload) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -1874,6 +2035,13 @@ test "buildSendKeysPayload rejects unknown key" {
     try std.testing.expectError(error.InvalidKeyName, buildSendKeysPayload(std.testing.allocator, &.{"banana"}));
 }
 
+test "parseSignalName accepts symbolic and numeric forms" {
+    try std.testing.expectEqual(posix.SIG.INT, try parseSignalName("int"));
+    try std.testing.expectEqual(posix.SIG.TERM, try parseSignalName("SIGTERM"));
+    try std.testing.expectEqual(@as(i32, 15), try parseSignalName("15"));
+    try std.testing.expectError(error.UnsupportedSignal, parseSignalName("banana"));
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 fn clientLoop(client_sock_fd: i32) !void {
@@ -2223,8 +2391,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Kill => {
                             break :daemon_loop;
                         },
+                        .Interrupt => try daemon.handleInterrupt(pty_fd, msg.payload),
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
+                        .Signal => try daemon.handleSignal(pty_fd, msg.payload),
                         .Run => try daemon.handleRun(client, pty_fd, msg.payload),
                         .Output, .Ack => {},
                         _ => std.log.warn(

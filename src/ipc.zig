@@ -15,8 +15,10 @@ pub const Tag = enum(u8) {
     History = 8,
     Run = 9,
     Ack = 10,
+    Interrupt = 11,
+    Signal = 12,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (11-255) are representable
+    // @enumFromInt, so out-of-range values (13-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -54,6 +56,17 @@ pub const Info = extern struct {
     created_at: u64,
     task_ended_at: u64,
     task_exit_code: u8,
+};
+
+pub const SignalScope = enum(u8) {
+    foreground = 0,
+    session_tree = 1,
+};
+
+pub const SignalRequest = extern struct {
+    signal: i32,
+    scope: SignalScope,
+    best_effort: u8,
 };
 
 pub fn expectedLength(data: []const u8) ?usize {
