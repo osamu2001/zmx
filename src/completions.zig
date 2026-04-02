@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run detach list completions kill history version help"
+    \\  local commands="create attach run detach list completions kill history version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,7 +37,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|kill|history)
+    \\    create|attach|run|kill|history)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -70,6 +70,7 @@ const zsh_completions =
     \\    commands)
     \\      local -a commands
     \\      commands=(
+    \\        'create:Create a session without attaching'
     \\        'attach:Attach to session, creating if needed'
     \\        'run:Send command without attaching'
     \\        'detach:Detach all clients from current session'
@@ -84,7 +85,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|history|hi)
+    \\        create|attach|a|kill|k|run|r|history|hi)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
@@ -118,6 +119,7 @@ const zsh_completions =
 const fish_completions =
     \\complete -c zmx -f
     \\
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'create' -d 'Create a session without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'r run' -d 'Send command without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from current session'
@@ -131,7 +133,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
     \\complete -c zmx -s h -d 'Show help message'
     \\
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from create a attach r run k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
     \\
@@ -139,3 +141,9 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
 ;
+
+test "completion scripts include create command" {
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "create attach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "create:Create a session without attaching") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'create' -d 'Create a session without attaching'") != null);
+}

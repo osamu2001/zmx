@@ -66,6 +66,25 @@ pub fn main() !void {
         return printVersion(&cfg);
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help();
+    } else if (std.mem.eql(u8, cmd, "create")) {
+        const session_name = args.next() orelse "";
+
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(alloc);
+        while (args.next()) |arg| {
+            try command_args.append(alloc, arg);
+        }
+
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+        const command = if (command_args.items.len > 0) command_args.items else null;
+
+        var daemon = initSessionDaemon(&cfg, alloc, session_name, cwd, command, false, null) catch |err| switch (err) {
+            error.NameTooLong => return,
+            error.OutOfMemory => return err,
+            else => return err,
+        };
+        return create(&daemon);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
         return list(&cfg, short);
@@ -105,34 +124,14 @@ pub fn main() !void {
             try command_args.append(alloc, arg);
         }
 
-        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
-        var command: ?[][]const u8 = null;
-        if (command_args.items.len > 0) {
-            command = command_args.items;
-        }
-
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.posix.getcwd(&cwd_buf) catch "";
-
-        const sesh = try socket.getSeshName(alloc, session_name);
-        defer alloc.free(sesh);
-        var daemon = Daemon{
-            .running = true,
-            .cfg = &cfg,
-            .alloc = alloc,
-            .clients = clients,
-            .session_name = sesh,
-            .socket_path = undefined,
-            .pid = undefined,
-            .command = command,
-            .cwd = cwd,
-            .created_at = @intCast(std.time.timestamp()),
-        };
-        daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
-            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+        const command = if (command_args.items.len > 0) command_args.items else null;
+        var daemon = initSessionDaemon(&cfg, alloc, session_name, cwd, command, false, null) catch |err| switch (err) {
+            error.NameTooLong => return,
             error.OutOfMemory => return err,
+            else => return err,
         };
-        std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
@@ -142,32 +141,13 @@ pub fn main() !void {
         while (args.next()) |arg| {
             try cmd_args_raw.append(alloc, arg);
         }
-        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
-
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.posix.getcwd(&cwd_buf) catch "";
-
-        const sesh = try socket.getSeshName(alloc, session_name);
-        defer alloc.free(sesh);
-        var daemon = Daemon{
-            .running = true,
-            .cfg = &cfg,
-            .alloc = alloc,
-            .clients = clients,
-            .session_name = sesh,
-            .socket_path = undefined,
-            .pid = undefined,
-            .command = null,
-            .cwd = cwd,
-            .created_at = @intCast(std.time.timestamp()),
-            .is_task_mode = true,
-            .task_command = cmd_args_raw.items,
-        };
-        daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
-            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+        var daemon = initSessionDaemon(&cfg, alloc, session_name, cwd, null, true, cmd_args_raw.items) catch |err| switch (err) {
+            error.NameTooLong => return,
             error.OutOfMemory => return err,
+            else => return err,
         };
-        std.log.info("socket path={s}", .{daemon.socket_path});
         return run(&daemon, cmd_args_raw.items);
     } else if (std.mem.eql(u8, cmd, "wait") or std.mem.eql(u8, cmd, "w")) {
         var args_raw: std.ArrayList([]const u8) = .empty;
@@ -185,6 +165,46 @@ pub fn main() !void {
     } else {
         return help();
     }
+}
+
+fn initSessionDaemon(
+    cfg: *Cfg,
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    cwd: []const u8,
+    command: ?[]const []const u8,
+    is_task_mode: bool,
+    task_command: ?[]const []const u8,
+) !Daemon {
+    var clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+    errdefer clients.deinit(alloc);
+
+    const sesh = try socket.getSeshName(alloc, session_name);
+    errdefer alloc.free(sesh);
+
+    var daemon = Daemon{
+        .running = true,
+        .cfg = cfg,
+        .alloc = alloc,
+        .clients = clients,
+        .session_name = sesh,
+        .socket_path = undefined,
+        .pid = undefined,
+        .command = command,
+        .cwd = cwd,
+        .created_at = @intCast(std.time.timestamp()),
+        .is_task_mode = is_task_mode,
+        .task_command = task_command,
+    };
+    daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(sesh, cfg.socket_dir);
+            return error.NameTooLong;
+        },
+        error.OutOfMemory => return err,
+    };
+    std.log.info("socket path={s}", .{daemon.socket_path});
+    return daemon;
 }
 
 /// Client represents each terminal that has connected to a session.
@@ -756,6 +776,7 @@ fn help() !void {
         \\Usage: zmx <command> [args]
         \\
         \\Commands:
+        \\  create <name> [command...]     Create a session without attaching
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
@@ -1136,6 +1157,18 @@ fn attach(daemon: *Daemon) !void {
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
     try clientLoop(client_sock);
+}
+
+fn create(daemon: *Daemon) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+
+    const result = try daemon.ensureSession();
+    if (result.is_daemon) return;
+    if (!result.created) return;
+
+    try w.interface.print("session \"{s}\" created\n", .{daemon.session_name});
+    try w.interface.flush();
 }
 
 fn run(daemon: *Daemon, command_args: [][]const u8) !void {
