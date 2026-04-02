@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="create attach run detach info list completions kill history version help"
+    \\  local commands="create attach run detach info input list completions kill history version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,12 +37,15 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    create|attach|run|info|kill|history)
+    \\    create|attach|run|info|input|kill|history)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+    \\      ;;
+    \\    input)
+    \\      COMPREPLY=($(compgen -W "--stdin --enter --no-newline" -- "$cur"))
     \\      ;;
     \\    list)
     \\      COMPREPLY=($(compgen -W "--short --json" -- "$cur"))
@@ -75,6 +78,7 @@ const zsh_completions =
     \\        'run:Send command without attaching'
     \\        'detach:Detach all clients from current session'
     \\        'info:Show session details'
+    \\        'input:Send text input without attaching'
     \\        'list:List active sessions'
     \\        'completions:Shell completion scripts'
     \\        'kill:Kill a session'
@@ -86,11 +90,14 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        create|attach|a|kill|k|run|r|info|history|hi)
+    \\        create|attach|a|kill|k|run|r|info|input|history|hi)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
+    \\          ;;
+    \\        input)
+    \\          _values 'options' '--stdin' '--enter' '--no-newline'
     \\          ;;
     \\        list|l)
     \\          _values 'options' '--short' '--json'
@@ -125,6 +132,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'r run' -d 'Send command without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from current session'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'info' -d 'Show session details'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'input' -d 'Send text input without attaching'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'l list' -d 'List active sessions'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'c completions' -d 'Shell completion scripts'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
@@ -135,10 +143,13 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
     \\complete -c zmx -s h -d 'Show help message'
     \\
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from create a attach r run info k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from create a attach r run info input k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
     \\
+    \\complete -c zmx -n "__fish_seen_subcommand_from input" -l stdin -d 'Read input from stdin'
+    \\complete -c zmx -n "__fish_seen_subcommand_from input" -l enter -d 'Append carriage return'
+    \\complete -c zmx -n "__fish_seen_subcommand_from input" -l no-newline -d 'Do not append a newline'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l json -d 'JSON output'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
@@ -155,6 +166,12 @@ test "completion scripts include info command" {
     try std.testing.expect(std.mem.indexOf(u8, bash_completions, "info") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "info:Show session details") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'info' -d 'Show session details'") != null);
+}
+
+test "completion scripts include input command" {
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "input:Send text input without attaching") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'input' -d 'Send text input without attaching'") != null);
 }
 
 test "completion scripts include list json flag" {

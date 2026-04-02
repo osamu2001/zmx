@@ -129,6 +129,31 @@ fn realMain() !void {
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
         return info(&cfg, sesh, json);
+    } else if (std.mem.eql(u8, cmd, "input")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        var read_stdin = false;
+        var newline_policy: InputNewlinePolicy = .newline;
+        var text_parts: std.ArrayList([]const u8) = .empty;
+        defer text_parts.deinit(alloc);
+
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--stdin")) {
+                read_stdin = true;
+            } else if (std.mem.eql(u8, arg, "--enter")) {
+                newline_policy = .enter;
+            } else if (std.mem.eql(u8, arg, "--no-newline")) {
+                newline_policy = .none;
+            } else {
+                try text_parts.append(alloc, arg);
+            }
+        }
+
+        const payload = try buildInputPayload(alloc, text_parts.items, read_stdin, newline_policy);
+        defer alloc.free(payload);
+        return input(&cfg, sesh, payload);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         var short = false;
         var json = false;
@@ -868,6 +893,7 @@ fn help() !void {
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  info <name> [--json]           Show session details
+        \\  input <name> [text...]         Send text input without attaching (--stdin/--enter/--no-newline)
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
@@ -1007,6 +1033,110 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
     if (task_ended_at) |value| try out.interface.print("task_ended_at={s}\n", .{value});
     if (task_exit_code) |value| try out.interface.print("task_exit_code={d}\n", .{value});
     try out.interface.flush();
+}
+
+const InputNewlinePolicy = enum {
+    newline,
+    enter,
+    none,
+};
+
+fn appendInputTerminator(buffer: *std.ArrayList(u8), alloc: std.mem.Allocator, policy: InputNewlinePolicy) !void {
+    switch (policy) {
+        .none => {},
+        .newline => {
+            if (buffer.items.len == 0 or (buffer.items[buffer.items.len - 1] != '\n' and buffer.items[buffer.items.len - 1] != '\r')) {
+                try buffer.append(alloc, '\n');
+            }
+        },
+        .enter => {
+            if (buffer.items.len == 0) {
+                try buffer.append(alloc, '\r');
+                return;
+            }
+            const last = buffer.items.len - 1;
+            if (buffer.items[last] == '\n') {
+                buffer.items[last] = '\r';
+            } else if (buffer.items[last] != '\r') {
+                try buffer.append(alloc, '\r');
+            }
+        },
+    }
+}
+
+fn buildInputPayload(
+    alloc: std.mem.Allocator,
+    text_parts: []const []const u8,
+    read_stdin: bool,
+    newline_policy: InputNewlinePolicy,
+) ![]u8 {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    if (read_stdin) {
+        while (true) {
+            var tmp: [4096]u8 = undefined;
+            const n = posix.read(posix.STDIN_FILENO, &tmp) catch |err| {
+                if (err == error.WouldBlock) break;
+                return err;
+            };
+            if (n == 0) break;
+            try payload.appendSlice(alloc, tmp[0..n]);
+        }
+    } else {
+        for (text_parts, 0..) |arg, i| {
+            if (i > 0) try payload.append(alloc, ' ');
+            try payload.appendSlice(alloc, arg);
+        }
+    }
+
+    if (payload.items.len == 0 and newline_policy == .none) {
+        return error.CommandRequired;
+    }
+
+    try appendInputTerminator(&payload, alloc, newline_policy);
+    return payload.toOwnedSlice(alloc);
+}
+
+fn input(cfg: *Cfg, session_name: []const u8, payload: []const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.OutOfMemory => return err,
+    };
+    defer alloc.free(socket_path);
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, session_name);
+    if (!exists) {
+        var buf: [4096]u8 = undefined;
+        var w = std.fs.File.stderr().writer(&buf);
+        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
+        w.interface.flush() catch {};
+        return error.SessionNotFound;
+    }
+
+    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
+        return err;
+    };
+    defer posix.close(result.fd);
+
+    ipc.send(result.fd, .Input, payload) catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return,
+        else => return err,
+    };
+
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("input sent\n", .{});
+    try w.interface.flush();
 }
 
 fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
@@ -1666,6 +1796,22 @@ test "list helpers derive stable state and status" {
     };
     try std.testing.expectEqualStrings("unreachable", listState(unreachable_session));
     try std.testing.expectEqualStrings("cleaning-up", listStatus(unreachable_session));
+}
+
+test "buildInputPayload appends configured newline policy" {
+    const alloc = std.testing.allocator;
+
+    const newline = try buildInputPayload(alloc, &.{"echo hi"}, false, .newline);
+    defer alloc.free(newline);
+    try std.testing.expectEqualStrings("echo hi\n", newline);
+
+    const enter = try buildInputPayload(alloc, &.{"echo hi"}, false, .enter);
+    defer alloc.free(enter);
+    try std.testing.expectEqualStrings("echo hi\r", enter);
+
+    const none = try buildInputPayload(alloc, &.{"echo hi"}, false, .none);
+    defer alloc.free(none);
+    try std.testing.expectEqualStrings("echo hi", none);
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
