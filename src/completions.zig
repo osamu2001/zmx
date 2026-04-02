@@ -45,7 +45,7 @@ const bash_completions =
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
     \\      ;;
     \\    list)
-    \\      COMPREPLY=($(compgen -W "--short" -- "$cur"))
+    \\      COMPREPLY=($(compgen -W "--short --json" -- "$cur"))
     \\      ;;
     \\    *)
     \\      ;;
@@ -93,7 +93,7 @@ const zsh_completions =
     \\          _values 'shell' 'bash' 'zsh' 'fish'
     \\          ;;
     \\        list|l)
-    \\          _values 'options' '--short'
+    \\          _values 'options' '--short' '--json'
     \\          ;;
     \\      esac
     \\      ;;
@@ -140,6 +140,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
     \\
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
+    \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l json -d 'JSON output'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
 ;
@@ -154,4 +155,10 @@ test "completion scripts include info command" {
     try std.testing.expect(std.mem.indexOf(u8, bash_completions, "info") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "info:Show session details") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_completions, "a 'info' -d 'Show session details'") != null);
+}
+
+test "completion scripts include list json flag" {
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "--short --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "'--json'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "-l json -d 'JSON output'") != null);
 }

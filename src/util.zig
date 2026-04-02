@@ -10,6 +10,8 @@ pub const SessionEntry = struct {
     clients_len: ?usize,
     is_error: bool,
     error_name: ?[]const u8,
+    is_task_mode: bool,
+    task_running: bool,
     cmd: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     created_at: u64,
@@ -56,6 +58,8 @@ pub fn get_session_entries(
                     .clients_len = null,
                     .is_error = true,
                     .error_name = @errorName(err),
+                    .is_task_mode = false,
+                    .task_running = false,
                     .created_at = 0,
                     .task_exit_code = 1,
                     .task_ended_at = 0,
@@ -89,6 +93,8 @@ pub fn get_session_entries(
                 .clients_len = result.info.clients_len,
                 .is_error = false,
                 .error_name = null,
+                .is_task_mode = result.info.is_task_mode != 0,
+                .task_running = result.info.task_running != 0,
                 .cmd = cmd,
                 .cwd = cwd,
                 .created_at = result.info.created_at,
@@ -290,6 +296,30 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
+const SYNC_OUTPUT_ENABLE = "\x1b[?2026h";
+const SYNC_OUTPUT_DISABLE = "\x1b[?2026l";
+
+fn stripSynchronizedOutputSequences(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    var cleaned: std.ArrayList(u8) = .empty;
+    defer cleaned.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        if (std.mem.startsWith(u8, input[i..], SYNC_OUTPUT_ENABLE)) {
+            i += SYNC_OUTPUT_ENABLE.len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, input[i..], SYNC_OUTPUT_DISABLE)) {
+            i += SYNC_OUTPUT_DISABLE.len;
+            continue;
+        }
+        try cleaned.append(alloc, input[i]);
+        i += 1;
+    }
+
+    return cleaned.toOwnedSlice(alloc);
+}
+
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -324,6 +354,15 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
+
+    if (std.mem.indexOf(u8, output, SYNC_OUTPUT_ENABLE) != null or
+        std.mem.indexOf(u8, output, SYNC_OUTPUT_DISABLE) != null)
+    {
+        return stripSynchronizedOutputSequences(alloc, output) catch |err| {
+            std.log.warn("failed to sanitize terminal state err={s}", .{@errorName(err)});
+            return null;
+        };
+    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
@@ -460,6 +499,8 @@ test "writeSessionLine formats output for current session and short output" {
         .clients_len = 2,
         .is_error = false,
         .error_name = null,
+        .is_task_mode = false,
+        .task_running = false,
         .cmd = null,
         .cwd = null,
         .created_at = 0,
@@ -726,9 +767,9 @@ test "serializeTerminalState excludes synchronized output replay" {
     var stream = term.vtStream();
     defer stream.deinit();
 
-    stream.nextSlice("\x1b[?2004h"); // Bracketed paste
-    stream.nextSlice("\x1b[?2026h"); // Synchronized output
-    stream.nextSlice("hello");
+    try stream.nextSlice("\x1b[?2004h"); // Bracketed paste
+    try stream.nextSlice("\x1b[?2026h"); // Synchronized output
+    try stream.nextSlice("hello");
 
     try std.testing.expect(term.modes.get(.bracketed_paste));
     try std.testing.expect(term.modes.get(.synchronized_output));
@@ -746,7 +787,7 @@ test "serializeTerminalState excludes synchronized output replay" {
 
     var restored_stream = restored.vtStream();
     defer restored_stream.deinit();
-    restored_stream.nextSlice(output);
+    try restored_stream.nextSlice(output);
 
     try std.testing.expect(restored.modes.get(.bracketed_paste));
     try std.testing.expect(!restored.modes.get(.synchronized_output));

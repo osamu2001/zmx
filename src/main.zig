@@ -88,7 +88,7 @@ fn realMain() !void {
     defer log_system.deinit();
 
     const cmd = args.next() orelse {
-        return list(&cfg, false);
+        return list(&cfg, false, false);
     };
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
@@ -130,8 +130,16 @@ fn realMain() !void {
         defer alloc.free(sesh);
         return info(&cfg, sesh, json);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
-        const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
-        return list(&cfg, short);
+        var short = false;
+        var json = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--short")) {
+                short = true;
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
+            }
+        }
+        return list(&cfg, short, json);
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse return;
         const shell = completions.Shell.fromString(arg) orelse return;
@@ -860,7 +868,7 @@ fn help() !void {
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  info <name> [--json]           Show session details
-        \\  [l]ist [--short]               List active sessions
+        \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [w]ait <name>...               Wait for session tasks to complete
@@ -1108,7 +1116,108 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
     }
 }
 
-fn list(cfg: *Cfg, short: bool) !void {
+const ListJsonTask = struct {
+    mode: bool,
+    running: bool,
+    ended_at: ?[]const u8,
+    exit_code: ?u8,
+};
+
+const ListJsonError = struct {
+    code: []const u8,
+    message: []const u8,
+};
+
+const ListJsonEntry = struct {
+    name: []const u8,
+    socket_path: []const u8,
+    state: []const u8,
+    status: []const u8,
+    healthy: bool,
+    is_current: bool,
+    pid: ?i32,
+    clients: ?usize,
+    cmd: ?[]const u8,
+    cwd: ?[]const u8,
+    created_at: ?[]const u8,
+    task: ListJsonTask,
+    @"error": ?ListJsonError,
+};
+
+fn listState(session: util.SessionEntry) []const u8 {
+    if (session.is_error) return "unreachable";
+    if (session.is_task_mode and session.task_running) return "task-running";
+    return "running";
+}
+
+fn listStatus(session: util.SessionEntry) []const u8 {
+    if (!session.is_error) return "ok";
+    if (session.error_name) |name| {
+        if (std.mem.eql(u8, name, "ConnectionRefused")) return "cleaning-up";
+    }
+    return "unreachable";
+}
+
+fn writeListJsonEntry(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    cfg: *Cfg,
+    session: util.SessionEntry,
+    current_session: ?[]const u8,
+) !void {
+    const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, session.name);
+    defer alloc.free(socket_path);
+
+    const is_current = if (current_session) |current|
+        std.mem.eql(u8, current, session.name)
+    else
+        false;
+
+    const created_at = if (!session.is_error and session.created_at > 0)
+        try formatTimestampUtc(alloc, session.created_at)
+    else
+        null;
+    defer if (created_at) |value| alloc.free(value);
+
+    const task_ended_at = if (!session.is_error and session.task_ended_at != null and session.task_ended_at.? > 0)
+        try formatTimestampUtc(alloc, session.task_ended_at.?)
+    else
+        null;
+    defer if (task_ended_at) |value| alloc.free(value);
+
+    const payload: ListJsonEntry = .{
+        .name = session.name,
+        .socket_path = socket_path,
+        .state = listState(session),
+        .status = listStatus(session),
+        .healthy = !session.is_error,
+        .is_current = is_current,
+        .pid = session.pid,
+        .clients = session.clients_len,
+        .cmd = session.cmd,
+        .cwd = session.cwd,
+        .created_at = created_at,
+        .task = .{
+            .mode = session.is_task_mode,
+            .running = session.task_running,
+            .ended_at = task_ended_at,
+            .exit_code = if (session.is_task_mode and !session.task_running and session.task_ended_at != null and session.task_ended_at.? > 0)
+                session.task_exit_code
+            else
+                null,
+        },
+        .@"error" = if (session.is_error)
+            .{
+                .code = session.error_name orelse "unknown",
+                .message = session.error_name orelse "unknown",
+            }
+        else
+            null,
+    };
+    try writer.print("{f}", .{std.json.fmt(payload, .{})});
+}
+
+fn list(cfg: *Cfg, short: bool, json: bool) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1130,6 +1239,11 @@ fn list(cfg: *Cfg, short: bool) !void {
     }
 
     if (sessions.items.len == 0) {
+        if (json) {
+            try stdout.interface.print("[]\n", .{});
+            try stdout.interface.flush();
+            return;
+        }
         if (short) return;
         var errbuf: [4096]u8 = undefined;
         var stderr = std.fs.File.stderr().writer(&errbuf);
@@ -1139,6 +1253,17 @@ fn list(cfg: *Cfg, short: bool) !void {
     }
 
     std.mem.sort(util.SessionEntry, sessions.items, {}, util.SessionEntry.lessThan);
+
+    if (json) {
+        try stdout.interface.print("[", .{});
+        for (sessions.items, 0..) |session, i| {
+            if (i > 0) try stdout.interface.print(",", .{});
+            try writeListJsonEntry(&stdout.interface, alloc, cfg, session, current_session);
+        }
+        try stdout.interface.print("]\n", .{});
+        try stdout.interface.flush();
+        return;
+    }
 
     for (sessions.items) |session| {
         try util.writeSessionLine(&stdout.interface, session, short, current_session);
@@ -1505,6 +1630,42 @@ test "formatTimestampUtc formats epoch seconds as RFC3339 UTC" {
     const formatted = try formatTimestampUtc(alloc, 0);
     defer alloc.free(formatted);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", formatted);
+}
+
+test "list helpers derive stable state and status" {
+    const running = util.SessionEntry{
+        .name = "task",
+        .pid = 42,
+        .clients_len = 0,
+        .is_error = false,
+        .error_name = null,
+        .is_task_mode = true,
+        .task_running = true,
+        .cmd = null,
+        .cwd = null,
+        .created_at = 0,
+        .task_ended_at = null,
+        .task_exit_code = null,
+    };
+    try std.testing.expectEqualStrings("task-running", listState(running));
+    try std.testing.expectEqualStrings("ok", listStatus(running));
+
+    const unreachable_session = util.SessionEntry{
+        .name = "stale",
+        .pid = null,
+        .clients_len = null,
+        .is_error = true,
+        .error_name = "ConnectionRefused",
+        .is_task_mode = false,
+        .task_running = false,
+        .cmd = null,
+        .cwd = null,
+        .created_at = 0,
+        .task_ended_at = 0,
+        .task_exit_code = 1,
+    };
+    try std.testing.expectEqualStrings("unreachable", listState(unreachable_session));
+    try std.testing.expectEqualStrings("cleaning-up", listStatus(unreachable_session));
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
