@@ -46,6 +46,10 @@ const ExitCode = enum(u8) {
     unsupported = 6,
 };
 
+fn currentTimestamp() u64 {
+    return @intCast(std.time.timestamp());
+}
+
 fn exitCodeForError(err: anyerror) u8 {
     return switch (err) {
         error.SessionNotFound => @intFromEnum(ExitCode.not_found),
@@ -345,7 +349,11 @@ fn initSessionDaemon(
         .pid = undefined,
         .command = command,
         .cwd = cwd,
-        .created_at = @intCast(std.time.timestamp()),
+        .created_at = currentTimestamp(),
+        .last_activity_at = null,
+        .last_output_at = null,
+        .last_input_at = null,
+        .last_client_attach_at = null,
         .is_task_mode = is_task_mode,
         .task_command = task_command,
     };
@@ -459,6 +467,10 @@ const Daemon = struct {
     has_pty_output: bool = false,
     has_had_client: bool = false,
     created_at: u64, // unix timestamp (ns)
+    last_activity_at: ?u64 = null,
+    last_output_at: ?u64 = null,
+    last_input_at: ?u64 = null,
+    last_client_attach_at: ?u64 = null,
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
@@ -699,8 +711,10 @@ const Daemon = struct {
     }
 
     pub fn handleInput(self: *Daemon, pty_fd: i32, payload: []const u8) void {
-        _ = self;
         if (payload.len > 0) {
+            const now = currentTimestamp();
+            self.last_input_at = now;
+            self.last_activity_at = now;
             ptyWrite(pty_fd, payload);
         }
     }
@@ -751,6 +765,9 @@ const Daemon = struct {
 
         // Mark that we've had a client init, so subsequent clients get terminal state
         self.has_had_client = true;
+        const now = currentTimestamp();
+        self.last_client_attach_at = now;
+        self.last_activity_at = now;
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -852,6 +869,10 @@ const Daemon = struct {
             .pid = self.pid,
             .is_task_mode = @intFromBool(self.is_task_mode),
             .task_running = @intFromBool(self.is_task_mode and self.task_exit_code == null),
+            .last_activity_at = self.last_activity_at orelse 0,
+            .last_output_at = self.last_output_at orelse 0,
+            .last_input_at = self.last_input_at orelse 0,
+            .last_client_attach_at = self.last_client_attach_at orelse 0,
             .cmd_len = cmd_len,
             .cwd_len = cwd_len,
             .cmd = cmd_buf,
@@ -891,6 +912,9 @@ const Daemon = struct {
         self.task_exit_code = null;
         self.task_ended_at = null;
         self.is_task_mode = true;
+        const now = currentTimestamp();
+        self.last_input_at = now;
+        self.last_activity_at = now;
 
         if (payload.len > 0) {
             ptyWrite(pty_fd, payload);
@@ -995,6 +1019,11 @@ fn formatTimestampUtc(alloc: std.mem.Allocator, timestamp: u64) ![]u8 {
     });
 }
 
+fn formatOptionalTimestampUtc(alloc: std.mem.Allocator, timestamp: u64) !?[]u8 {
+    if (timestamp == 0) return null;
+    return try formatTimestampUtc(alloc, timestamp);
+}
+
 fn help() !void {
     const help_text =
         \\zmx - session persistence for terminal processes
@@ -1083,6 +1112,14 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
         null;
     const created_at = try formatTimestampUtc(alloc, result.info.created_at);
     defer alloc.free(created_at);
+    const last_activity_at = try formatOptionalTimestampUtc(alloc, result.info.last_activity_at);
+    defer if (last_activity_at) |value| alloc.free(value);
+    const last_output_at = try formatOptionalTimestampUtc(alloc, result.info.last_output_at);
+    defer if (last_output_at) |value| alloc.free(value);
+    const last_input_at = try formatOptionalTimestampUtc(alloc, result.info.last_input_at);
+    defer if (last_input_at) |value| alloc.free(value);
+    const last_client_attach_at = try formatOptionalTimestampUtc(alloc, result.info.last_client_attach_at);
+    defer if (last_client_attach_at) |value| alloc.free(value);
 
     const is_task_mode = result.info.is_task_mode != 0;
     const task_running = result.info.task_running != 0;
@@ -1110,6 +1147,10 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
             cmd: ?[]const u8,
             cwd: ?[]const u8,
             created_at: []const u8,
+            last_activity_at: ?[]const u8,
+            last_output_at: ?[]const u8,
+            last_input_at: ?[]const u8,
+            last_client_attach_at: ?[]const u8,
             task: struct {
                 running: bool,
                 ended_at: ?[]const u8,
@@ -1125,6 +1166,10 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
             .cmd = cmd,
             .cwd = cwd,
             .created_at = created_at,
+            .last_activity_at = last_activity_at,
+            .last_output_at = last_output_at,
+            .last_input_at = last_input_at,
+            .last_client_attach_at = last_client_attach_at,
             .task = .{
                 .running = task_running,
                 .ended_at = task_ended_at,
@@ -1145,6 +1190,10 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
     try out.interface.print("pid={d}\n", .{result.info.pid});
     try out.interface.print("clients={d}\n", .{result.info.clients_len});
     try out.interface.print("created_at={s}\n", .{created_at});
+    if (last_activity_at) |value| try out.interface.print("last_activity_at={s}\n", .{value});
+    if (last_output_at) |value| try out.interface.print("last_output_at={s}\n", .{value});
+    if (last_input_at) |value| try out.interface.print("last_input_at={s}\n", .{value});
+    if (last_client_attach_at) |value| try out.interface.print("last_client_attach_at={s}\n", .{value});
     if (cwd) |value| try out.interface.print("cwd={s}\n", .{value});
     if (cmd) |value| try out.interface.print("cmd={s}\n", .{value});
     try out.interface.print("task_running={s}\n", .{if (task_running) "true" else "false"});
@@ -1588,6 +1637,10 @@ const ListJsonEntry = struct {
     cmd: ?[]const u8,
     cwd: ?[]const u8,
     created_at: ?[]const u8,
+    last_activity_at: ?[]const u8,
+    last_output_at: ?[]const u8,
+    last_input_at: ?[]const u8,
+    last_client_attach_at: ?[]const u8,
     task: ListJsonTask,
     @"error": ?ListJsonError,
 };
@@ -1626,6 +1679,26 @@ fn writeListJsonEntry(
     else
         null;
     defer if (created_at) |value| alloc.free(value);
+    const last_activity_at = if (!session.is_error and session.last_activity_at != null and session.last_activity_at.? > 0)
+        try formatTimestampUtc(alloc, session.last_activity_at.?)
+    else
+        null;
+    defer if (last_activity_at) |value| alloc.free(value);
+    const last_output_at = if (!session.is_error and session.last_output_at != null and session.last_output_at.? > 0)
+        try formatTimestampUtc(alloc, session.last_output_at.?)
+    else
+        null;
+    defer if (last_output_at) |value| alloc.free(value);
+    const last_input_at = if (!session.is_error and session.last_input_at != null and session.last_input_at.? > 0)
+        try formatTimestampUtc(alloc, session.last_input_at.?)
+    else
+        null;
+    defer if (last_input_at) |value| alloc.free(value);
+    const last_client_attach_at = if (!session.is_error and session.last_client_attach_at != null and session.last_client_attach_at.? > 0)
+        try formatTimestampUtc(alloc, session.last_client_attach_at.?)
+    else
+        null;
+    defer if (last_client_attach_at) |value| alloc.free(value);
 
     const task_ended_at = if (!session.is_error and session.task_ended_at != null and session.task_ended_at.? > 0)
         try formatTimestampUtc(alloc, session.task_ended_at.?)
@@ -1645,6 +1718,10 @@ fn writeListJsonEntry(
         .cmd = session.cmd,
         .cwd = session.cwd,
         .created_at = created_at,
+        .last_activity_at = last_activity_at,
+        .last_output_at = last_output_at,
+        .last_input_at = last_input_at,
+        .last_client_attach_at = last_client_attach_at,
         .task = .{
             .mode = session.is_task_mode,
             .running = session.task_running,
@@ -2092,6 +2169,10 @@ test "list helpers derive stable state and status" {
         .cmd = null,
         .cwd = null,
         .created_at = 0,
+        .last_activity_at = null,
+        .last_output_at = null,
+        .last_input_at = null,
+        .last_client_attach_at = null,
         .task_ended_at = null,
         .task_exit_code = null,
     };
@@ -2109,6 +2190,10 @@ test "list helpers derive stable state and status" {
         .cmd = null,
         .cwd = null,
         .created_at = 0,
+        .last_activity_at = null,
+        .last_output_at = null,
+        .last_input_at = null,
+        .last_client_attach_at = null,
         .task_ended_at = 0,
         .task_exit_code = 1,
     };
@@ -2388,6 +2473,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             };
             client.write_buf = try std.ArrayList(u8).initCapacity(client.alloc, 4096);
             try daemon.clients.append(daemon.alloc, client);
+            const now = currentTimestamp();
+            daemon.last_client_attach_at = now;
+            daemon.last_activity_at = now;
             std.log.info(
                 "client connected fd={d} total={d}",
                 .{ client_fd, daemon.clients.items.len },
@@ -2426,12 +2514,16 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     if (daemon.is_task_mode and daemon.task_exit_code == null) {
                         if (util.findTaskExitMarker(buf[0..n])) |exit_code| {
                             daemon.task_exit_code = exit_code;
-                            daemon.task_ended_at = @intCast(std.time.timestamp());
+                            daemon.task_ended_at = currentTimestamp();
 
                             std.log.info("task completed exit_code={d}", .{exit_code});
                             // Shell continues running - no break here
                         }
                     }
+
+                    const now = currentTimestamp();
+                    daemon.last_output_at = now;
+                    daemon.last_activity_at = now;
 
                     // Broadcast data to all clients
                     for (daemon.clients.items) |client| {

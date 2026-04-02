@@ -15,6 +15,10 @@ pub const SessionEntry = struct {
     cmd: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     created_at: u64,
+    last_activity_at: ?u64,
+    last_output_at: ?u64,
+    last_input_at: ?u64,
+    last_client_attach_at: ?u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
 
@@ -61,6 +65,10 @@ pub fn get_session_entries(
                     .is_task_mode = false,
                     .task_running = false,
                     .created_at = 0,
+                    .last_activity_at = null,
+                    .last_output_at = null,
+                    .last_input_at = null,
+                    .last_client_attach_at = null,
                     .task_exit_code = 1,
                     .task_ended_at = 0,
                 });
@@ -98,6 +106,10 @@ pub fn get_session_entries(
                 .cmd = cmd,
                 .cwd = cwd,
                 .created_at = result.info.created_at,
+                .last_activity_at = if (result.info.last_activity_at > 0) result.info.last_activity_at else null,
+                .last_output_at = if (result.info.last_output_at > 0) result.info.last_output_at else null,
+                .last_input_at = if (result.info.last_input_at > 0) result.info.last_input_at else null,
+                .last_client_attach_at = if (result.info.last_client_attach_at > 0) result.info.last_client_attach_at else null,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
             });
@@ -504,6 +516,10 @@ test "writeSessionLine formats output for current session and short output" {
         .cmd = null,
         .cwd = null,
         .created_at = 0,
+        .last_activity_at = null,
+        .last_output_at = null,
+        .last_input_at = null,
+        .last_client_attach_at = null,
         .task_ended_at = null,
         .task_exit_code = null,
     };
