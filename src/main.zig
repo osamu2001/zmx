@@ -36,7 +36,36 @@ var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 
-pub fn main() !void {
+const ExitCode = enum(u8) {
+    success = 0,
+    operational_failure = 1,
+    usage_error = 2,
+    not_found = 3,
+    already_exists = 4,
+    timeout = 5,
+    unsupported = 6,
+};
+
+fn exitCodeForError(err: anyerror) u8 {
+    return switch (err) {
+        error.SessionNotFound => @intFromEnum(ExitCode.not_found),
+        error.Timeout, error.SessionNotReady => @intFromEnum(ExitCode.timeout),
+        error.SessionNameRequired,
+        error.InvalidSessionName,
+        error.NameTooLong,
+        error.FileNotUnixSocket,
+        error.CommandRequired,
+        error.CannotAttachToSessionInSession,
+        => @intFromEnum(ExitCode.usage_error),
+        else => @intFromEnum(ExitCode.operational_failure),
+    };
+}
+
+pub fn main() void {
+    realMain() catch |err| std.process.exit(exitCodeForError(err));
+}
+
+fn realMain() !void {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
 
@@ -786,6 +815,22 @@ fn printCompletions(shell: completions.Shell) !void {
     try w.interface.flush();
 }
 
+fn writeJsonError(writer: anytype, code: []const u8, message: []const u8) !void {
+    const payload: struct {
+        @"error": struct {
+            code: []const u8,
+            message: []const u8,
+        },
+    } = .{
+        .@"error" = .{
+            .code = code,
+            .message = message,
+        },
+    };
+    try writer.print("{f}\n", .{std.json.fmt(payload, .{})});
+    try writer.flush();
+}
+
 fn formatTimestampUtc(alloc: std.mem.Allocator, timestamp: u64) ![]u8 {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp };
     const epoch_day = epoch_seconds.getEpochDay();
@@ -859,26 +904,14 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
             var out = std.fs.File.stdout().writer(&out_buf);
             const message = try std.fmt.allocPrint(alloc, "session '{s}' not found", .{session_name});
             defer alloc.free(message);
-            const payload: struct {
-                @"error": struct {
-                    code: []const u8,
-                    message: []const u8,
-                },
-            } = .{
-                .@"error" = .{
-                    .code = "session_not_found",
-                    .message = message,
-                },
-            };
-            try out.interface.print("{f}\n", .{std.json.fmt(payload, .{})});
-            try out.interface.flush();
+            try writeJsonError(&out.interface, "session_not_found", message);
         } else {
             var errbuf: [4096]u8 = undefined;
             var w = std.fs.File.stderr().writer(&errbuf);
             w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
             w.interface.flush() catch {};
         }
-        std.process.exit(1);
+        return error.SessionNotFound;
     }
 
     const result = ipc.probeSession(alloc, socket_path) catch |err| {
