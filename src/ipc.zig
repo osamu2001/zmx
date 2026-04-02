@@ -45,6 +45,8 @@ pub const MAX_CWD_LEN = 256;
 pub const Info = extern struct {
     clients_len: usize,
     pid: i32,
+    is_task_mode: u8,
+    task_running: u8,
     cmd_len: u16,
     cwd_len: u16,
     cmd: [MAX_CMD_LEN]u8,

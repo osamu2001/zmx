@@ -85,6 +85,21 @@ pub fn main() !void {
             else => return err,
         };
         return create(&daemon);
+    } else if (std.mem.eql(u8, cmd, "info")) {
+        var session_name: ?[]const u8 = null;
+        var json = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
+            } else if (session_name == null) {
+                session_name = arg;
+            }
+        }
+
+        const sesh_env = socket.getSeshNameFromEnv();
+        const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
+        defer alloc.free(sesh);
+        return info(&cfg, sesh, json);
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
         return list(&cfg, short);
@@ -694,9 +709,11 @@ const Daemon = struct {
         const cwd_len: u16 = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
         @memcpy(cwd_buf[0..cwd_len], self.cwd[0..cwd_len]);
 
-        const info = ipc.Info{
+        const session_info = ipc.Info{
             .clients_len = clients_len,
             .pid = self.pid,
+            .is_task_mode = @intFromBool(self.is_task_mode),
+            .task_running = @intFromBool(self.is_task_mode and self.task_exit_code == null),
             .cmd_len = cmd_len,
             .cwd_len = cwd_len,
             .cmd = cmd_buf,
@@ -705,7 +722,7 @@ const Daemon = struct {
             .task_ended_at = self.task_ended_at orelse 0,
             .task_exit_code = self.task_exit_code orelse 0,
         };
-        try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info));
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&session_info));
         client.has_pending_output = true;
     }
 
@@ -769,6 +786,23 @@ fn printCompletions(shell: completions.Shell) !void {
     try w.interface.flush();
 }
 
+fn formatTimestampUtc(alloc: std.mem.Allocator, timestamp: u64) ![]u8 {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+}
+
 fn help() !void {
     const help_text =
         \\zmx - session persistence for terminal processes
@@ -780,6 +814,7 @@ fn help() !void {
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
+        \\  info <name> [--json]           Show session details
         \\  [l]ist [--short]               List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
@@ -801,6 +836,136 @@ fn help() !void {
     var w = std.fs.File.stdout().writer(&buf);
     try w.interface.print(help_text, .{});
     try w.interface.flush();
+}
+
+fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.OutOfMemory => return err,
+    };
+    defer alloc.free(socket_path);
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, session_name);
+    if (!exists) {
+        if (json) {
+            var out_buf: [4096]u8 = undefined;
+            var out = std.fs.File.stdout().writer(&out_buf);
+            const message = try std.fmt.allocPrint(alloc, "session '{s}' not found", .{session_name});
+            defer alloc.free(message);
+            const payload: struct {
+                @"error": struct {
+                    code: []const u8,
+                    message: []const u8,
+                },
+            } = .{
+                .@"error" = .{
+                    .code = "session_not_found",
+                    .message = message,
+                },
+            };
+            try out.interface.print("{f}\n", .{std.json.fmt(payload, .{})});
+            try out.interface.flush();
+        } else {
+            var errbuf: [4096]u8 = undefined;
+            var w = std.fs.File.stderr().writer(&errbuf);
+            w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
+            w.interface.flush() catch {};
+        }
+        std.process.exit(1);
+    }
+
+    const result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
+        return err;
+    };
+    defer posix.close(result.fd);
+
+    const cmd = if (result.info.cmd_len > 0)
+        result.info.cmd[0..@min(result.info.cmd_len, ipc.MAX_CMD_LEN)]
+    else
+        null;
+    const cwd = if (result.info.cwd_len > 0)
+        result.info.cwd[0..@min(result.info.cwd_len, ipc.MAX_CWD_LEN)]
+    else
+        null;
+    const created_at = try formatTimestampUtc(alloc, result.info.created_at);
+    defer alloc.free(created_at);
+
+    const is_task_mode = result.info.is_task_mode != 0;
+    const task_running = result.info.task_running != 0;
+    const task_ended_at = if (is_task_mode and result.info.task_ended_at > 0)
+        try formatTimestampUtc(alloc, result.info.task_ended_at)
+    else
+        null;
+    defer if (task_ended_at) |value| alloc.free(value);
+
+    const task_exit_code = if (is_task_mode and !task_running and result.info.task_ended_at > 0)
+        @as(?u8, result.info.task_exit_code)
+    else
+        null;
+    const state: []const u8 = if (task_running) "task-running" else "running";
+
+    if (json) {
+        var out_buf: [4096]u8 = undefined;
+        var out = std.fs.File.stdout().writer(&out_buf);
+        const payload: struct {
+            name: []const u8,
+            state: []const u8,
+            healthy: bool,
+            pid: i32,
+            clients: usize,
+            cmd: ?[]const u8,
+            cwd: ?[]const u8,
+            created_at: []const u8,
+            task: struct {
+                running: bool,
+                ended_at: ?[]const u8,
+                exit_code: ?u8,
+            },
+            meta: struct {},
+        } = .{
+            .name = session_name,
+            .state = state,
+            .healthy = true,
+            .pid = result.info.pid,
+            .clients = result.info.clients_len,
+            .cmd = cmd,
+            .cwd = cwd,
+            .created_at = created_at,
+            .task = .{
+                .running = task_running,
+                .ended_at = task_ended_at,
+                .exit_code = task_exit_code,
+            },
+            .meta = .{},
+        };
+        try out.interface.print("{f}\n", .{std.json.fmt(payload, .{})});
+        try out.interface.flush();
+        return;
+    }
+
+    var out_buf: [4096]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&out_buf);
+    try out.interface.print("name={s}\n", .{session_name});
+    try out.interface.print("state={s}\n", .{state});
+    try out.interface.print("healthy=true\n", .{});
+    try out.interface.print("pid={d}\n", .{result.info.pid});
+    try out.interface.print("clients={d}\n", .{result.info.clients_len});
+    try out.interface.print("created_at={s}\n", .{created_at});
+    if (cwd) |value| try out.interface.print("cwd={s}\n", .{value});
+    if (cmd) |value| try out.interface.print("cmd={s}\n", .{value});
+    try out.interface.print("task_running={s}\n", .{if (task_running) "true" else "false"});
+    if (task_ended_at) |value| try out.interface.print("task_ended_at={s}\n", .{value});
+    if (task_exit_code) |value| try out.interface.print("task_exit_code={d}\n", .{value});
+    try out.interface.flush();
 }
 
 fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8)) !void {
@@ -1300,6 +1465,13 @@ fn run(daemon: *Daemon, command_args: [][]const u8) !void {
     }
 
     return error.NoAckReceived;
+}
+
+test "formatTimestampUtc formats epoch seconds as RFC3339 UTC" {
+    const alloc = std.testing.allocator;
+    const formatted = try formatTimestampUtc(alloc, 0);
+    defer alloc.free(formatted);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", formatted);
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
