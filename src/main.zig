@@ -55,6 +55,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.NameTooLong,
         error.FileNotUnixSocket,
         error.CommandRequired,
+        error.InvalidKeyName,
         error.CannotAttachToSessionInSession,
         => @intFromEnum(ExitCode.usage_error),
         else => @intFromEnum(ExitCode.operational_failure),
@@ -153,7 +154,21 @@ fn realMain() !void {
 
         const payload = try buildInputPayload(alloc, text_parts.items, read_stdin, newline_policy);
         defer alloc.free(payload);
-        return input(&cfg, sesh, payload);
+        return sendPayload(&cfg, sesh, payload, "input sent");
+    } else if (std.mem.eql(u8, cmd, "send-keys")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(alloc);
+        while (args.next()) |arg| {
+            try keys.append(alloc, arg);
+        }
+
+        const payload = try buildSendKeysPayload(alloc, keys.items);
+        defer alloc.free(payload);
+        return sendPayload(&cfg, sesh, payload, "keys sent");
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         var short = false;
         var json = false;
@@ -894,6 +909,7 @@ fn help() !void {
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  info <name> [--json]           Show session details
         \\  input <name> [text...]         Send text input without attaching (--stdin/--enter/--no-newline)
+        \\  send-keys <name> <keys...>     Send special keys without attaching (enter/escape/ctrl-c/arrows)
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
@@ -1098,7 +1114,40 @@ fn buildInputPayload(
     return payload.toOwnedSlice(alloc);
 }
 
-fn input(cfg: *Cfg, session_name: []const u8, payload: []const u8) !void {
+fn keySequenceForName(name: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return")) return "\r";
+    if (std.ascii.eqlIgnoreCase(name, "escape") or std.ascii.eqlIgnoreCase(name, "esc")) return "\x1b";
+    if (std.ascii.eqlIgnoreCase(name, "tab")) return "\t";
+    if (std.ascii.eqlIgnoreCase(name, "backspace") or std.ascii.eqlIgnoreCase(name, "bs")) return "\x7f";
+    if (std.ascii.eqlIgnoreCase(name, "ctrl-c") or std.ascii.eqlIgnoreCase(name, "c-c")) return "\x03";
+    if (std.ascii.eqlIgnoreCase(name, "up") or std.ascii.eqlIgnoreCase(name, "arrow-up")) return "\x1b[A";
+    if (std.ascii.eqlIgnoreCase(name, "down") or std.ascii.eqlIgnoreCase(name, "arrow-down")) return "\x1b[B";
+    if (std.ascii.eqlIgnoreCase(name, "right") or std.ascii.eqlIgnoreCase(name, "arrow-right")) return "\x1b[C";
+    if (std.ascii.eqlIgnoreCase(name, "left") or std.ascii.eqlIgnoreCase(name, "arrow-left")) return "\x1b[D";
+    return null;
+}
+
+fn buildSendKeysPayload(alloc: std.mem.Allocator, keys: []const []const u8) ![]u8 {
+    if (keys.len == 0) return error.CommandRequired;
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    for (keys) |key_name| {
+        const seq = keySequenceForName(key_name) orelse {
+            var buf: [256]u8 = undefined;
+            var w = std.fs.File.stderr().writer(&buf);
+            w.interface.print("error: unsupported key \"{s}\"\n", .{key_name}) catch {};
+            w.interface.flush() catch {};
+            return error.InvalidKeyName;
+        };
+        try payload.appendSlice(alloc, seq);
+    }
+
+    return payload.toOwnedSlice(alloc);
+}
+
+fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success_message: []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -1135,7 +1184,7 @@ fn input(cfg: *Cfg, session_name: []const u8, payload: []const u8) !void {
 
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("input sent\n", .{});
+    try w.interface.print("{s}\n", .{success_message});
     try w.interface.flush();
 }
 
@@ -1812,6 +1861,17 @@ test "buildInputPayload appends configured newline policy" {
     const none = try buildInputPayload(alloc, &.{"echo hi"}, false, .none);
     defer alloc.free(none);
     try std.testing.expectEqualStrings("echo hi", none);
+}
+
+test "buildSendKeysPayload concatenates key sequences" {
+    const alloc = std.testing.allocator;
+    const payload = try buildSendKeysPayload(alloc, &.{ "escape", "up", "ctrl-c", "enter" });
+    defer alloc.free(payload);
+    try std.testing.expectEqualStrings("\x1b\x1b[A\x03\r", payload);
+}
+
+test "buildSendKeysPayload rejects unknown key" {
+    try std.testing.expectError(error.InvalidKeyName, buildSendKeysPayload(std.testing.allocator, &.{"banana"}));
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
