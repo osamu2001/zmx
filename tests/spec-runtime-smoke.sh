@@ -14,6 +14,12 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+assert_contains() {
+  value=$1
+  needle=$2
+  printf '%s' "$value" | grep -F "$needle" >/dev/null
+}
+
 ready_json() {
   "$ZMX_BIN" create controller sh -lc 'printf ready\n; exec sleep 1' >/dev/null
   "$ZMX_BIN" wait controller --for ready --timeout 5s --json
@@ -31,20 +37,20 @@ long_output_json() {
 }
 
 READY_JSON=$(ready_json)
-printf '%s' "$READY_JSON" | grep -F '"target":"ready"' >/dev/null
-printf '%s' "$READY_JSON" | grep -F '"name":"controller"' >/dev/null
+assert_contains "$READY_JSON" '"target":"ready"'
+assert_contains "$READY_JSON" '"name":"controller"'
 
 STATUS_OUTPUT=$("$ZMX_BIN" status controller)
-printf '%s' "$STATUS_OUTPUT" | grep -F 'name=controller' >/dev/null
+assert_contains "$STATUS_OUTPUT" 'name=controller'
 
 TASK_JSON=$(task_json)
-printf '%s' "$TASK_JSON" | grep -F '"target":"task-exit"' >/dev/null
-printf '%s' "$TASK_JSON" | grep -F '"name":"task-test"' >/dev/null
-printf '%s' "$TASK_JSON" | grep -F '"task_exit_code":0' >/dev/null
+assert_contains "$TASK_JSON" '"target":"task-exit"'
+assert_contains "$TASK_JSON" '"name":"task-test"'
+assert_contains "$TASK_JSON" '"task_exit_code":0'
 
 LONG_OUTPUT_JSON=$(long_output_json)
-printf '%s' "$LONG_OUTPUT_JSON" | grep -F '"encoding":"base64"' >/dev/null
+assert_contains "$LONG_OUTPUT_JSON" '"encoding":"base64"'
 printf '%s' "$LONG_OUTPUT_JSON" | grep -E '"byte_len":[1-9][0-9]+' >/dev/null
 
 MISSING_JSON=$("$ZMX_BIN" wait missing --for ready --timeout 200ms --json || true)
-printf '%s' "$MISSING_JSON" | grep -F '"requested_sessions":["missing"]' >/dev/null
+assert_contains "$MISSING_JSON" '"requested_sessions":["missing"]'

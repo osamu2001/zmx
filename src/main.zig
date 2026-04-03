@@ -1327,6 +1327,40 @@ fn rememberSeenWaitSession(
     try seen_names.append(alloc, try alloc.dupe(u8, session_name));
 }
 
+fn waitJsonSessionForTarget(session: util.SessionEntry, target: WaitTarget) WaitJsonSession {
+    const completed = switch (target) {
+        .task_exit => session.is_error or (session.task_ended_at != null and session.task_ended_at.? > 0),
+        .ready => sessionEntryReady(session),
+        .session_exit => false,
+    };
+    const task_exit_code = if (target != .task_exit)
+        null
+    else if (session.is_task_mode and !session.task_running and session.task_ended_at != null and session.task_ended_at.? > 0)
+        session.task_exit_code
+    else if (session.is_error)
+        @as(?u8, 1)
+    else
+        null;
+
+    return .{
+        .name = session.name,
+        .completed = completed,
+        .state = listState(session),
+        .health = listHealth(session),
+        .task_exit_code = task_exit_code,
+    };
+}
+
+fn exitedWaitJsonSession(session_name: []const u8) WaitJsonSession {
+    return .{
+        .name = session_name,
+        .completed = true,
+        .state = "exited",
+        .health = null,
+        .task_exit_code = null,
+    };
+}
+
 fn writeWaitJsonSummary(
     writer: anytype,
     target: WaitTarget,
@@ -2287,22 +2321,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                     defer summaries.deinit(alloc);
                     for (sessions.items) |session| {
                         if (!waitMatches(session.name, session_names.items)) continue;
-                        try summaries.append(alloc, .{
-                            .name = session.name,
-                            .completed = switch (target) {
-                                .task_exit => session.is_error or (session.task_ended_at != null and session.task_ended_at.? > 0),
-                                .ready => sessionEntryReady(session),
-                                .session_exit => false,
-                            },
-                            .state = listState(session),
-                            .health = listHealth(session),
-                            .task_exit_code = if (target == .task_exit and session.is_task_mode and !session.task_running and session.task_ended_at != null and session.task_ended_at.? > 0)
-                                session.task_exit_code
-                            else if (target == .task_exit and session.is_error)
-                                @as(?u8, 1)
-                            else
-                                null,
-                        });
+                        try summaries.append(alloc, waitJsonSessionForTarget(session, target));
                     }
                     try writeWaitJsonSummary(
                         stdout,
@@ -2339,13 +2358,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                     var summaries: std.ArrayList(WaitJsonSession) = .empty;
                     defer summaries.deinit(alloc);
                     for (seen_names.items) |session_name| {
-                        try summaries.append(alloc, .{
-                            .name = session_name,
-                            .completed = true,
-                            .state = "exited",
-                            .health = null,
-                            .task_exit_code = null,
-                        });
+                        try summaries.append(alloc, exitedWaitJsonSession(session_name));
                     }
                     try writeWaitJsonSummary(stdout, target, summaries.items, null);
                     try stdout.flush();
