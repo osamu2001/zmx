@@ -1330,17 +1330,58 @@ fn rememberSeenWaitSession(
 fn writeWaitJsonSummary(
     writer: anytype,
     target: WaitTarget,
-    session_count: usize,
+    sessions: []const WaitJsonSession,
     aggregate_exit_code: ?u8,
 ) !void {
     var first = true;
     try writer.writeByte('{');
     try writeJsonField(writer, &first, "target", waitTargetLabel(target));
     try writeJsonField(writer, &first, "completed", true);
-    try writeJsonField(writer, &first, "session_count", session_count);
+    try writeJsonField(writer, &first, "session_count", sessions.len);
     try writeJsonField(writer, &first, "aggregate_exit_code", aggregate_exit_code);
+    if (!first) try writer.writeByte(',');
+    first = false;
+    try writer.print("{f}:[", .{std.json.fmt("sessions", .{})});
+    for (sessions, 0..) |session, i| {
+        if (i > 0) try writer.writeByte(',');
+        var session_first = true;
+        try writer.writeByte('{');
+        try writeJsonField(writer, &session_first, "name", session.name);
+        try writeJsonField(writer, &session_first, "completed", session.completed);
+        try writeJsonField(writer, &session_first, "state", session.state);
+        try writeJsonField(writer, &session_first, "health", session.health);
+        try writeJsonField(writer, &session_first, "task_exit_code", session.task_exit_code);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
     try writer.writeAll("}\n");
-    try writer.flush();
+}
+
+fn writeWaitJsonError(
+    writer: anytype,
+    code: []const u8,
+    message: []const u8,
+    target: WaitTarget,
+    requested_sessions: []const []const u8,
+) !void {
+    var first = true;
+    try writer.writeByte('{');
+    try writeJsonField(writer, &first, "target", waitTargetLabel(target));
+    if (!first) try writer.writeByte(',');
+    first = false;
+    try writer.print("{f}:[", .{std.json.fmt("requested_sessions", .{})});
+    for (requested_sessions, 0..) |session_name, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print("{f}", .{std.json.fmt(session_name, .{})});
+    }
+    try writer.writeByte(']');
+    if (!first) try writer.writeByte(',');
+    first = false;
+    try writer.print("{f}:{{", .{std.json.fmt("error", .{})});
+    var err_first = true;
+    try writeJsonField(writer, &err_first, "code", code);
+    try writeJsonField(writer, &err_first, "message", message);
+    try writer.writeAll("}}\n");
 }
 
 const SessionMetaResult = struct {
@@ -2149,7 +2190,8 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                 if (json) {
                     const message = try std.fmt.allocPrint(alloc, "timed out waiting for {s}", .{target_label});
                     defer alloc.free(message);
-                    try writeJsonError(stdout, "timeout", message);
+                    try writeWaitJsonError(stdout, "timeout", message, target, session_names.items);
+                    try stdout.flush();
                 } else {
                     try stderr.print("error: timed out waiting for {s}\n", .{target_label});
                     try stderr.flush();
@@ -2225,7 +2267,8 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                         .{max_seen - total},
                     );
                     defer alloc.free(message);
-                    try writeJsonError(stdout, "sessions_disappeared", message);
+                    try writeWaitJsonError(stdout, "sessions_disappeared", message, target, session_names.items);
+                    try stdout.flush();
                 } else {
                     try stderr.print(
                         "error: {d} session(s) disappeared before completing\n",
@@ -2240,12 +2283,34 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
 
             if (total > 0 and total == done) {
                 if (json) {
+                    var summaries: std.ArrayList(WaitJsonSession) = .empty;
+                    defer summaries.deinit(alloc);
+                    for (sessions.items) |session| {
+                        if (!waitMatches(session.name, session_names.items)) continue;
+                        try summaries.append(alloc, .{
+                            .name = session.name,
+                            .completed = switch (target) {
+                                .task_exit => session.is_error or (session.task_ended_at != null and session.task_ended_at.? > 0),
+                                .ready => sessionEntryReady(session),
+                                .session_exit => false,
+                            },
+                            .state = listState(session),
+                            .health = listHealth(session),
+                            .task_exit_code = if (target == .task_exit and session.is_task_mode and !session.task_running and session.task_ended_at != null and session.task_ended_at.? > 0)
+                                session.task_exit_code
+                            else if (target == .task_exit and session.is_error)
+                                @as(?u8, 1)
+                            else
+                                null,
+                        });
+                    }
                     try writeWaitJsonSummary(
                         stdout,
                         target,
-                        @intCast(total),
+                        summaries.items,
                         if (target == .task_exit) @as(?u8, agg_exit_code) else null,
                     );
+                    try stdout.flush();
                 } else {
                     const success_message = switch (target) {
                         .task_exit => "tasks completed!",
@@ -2271,7 +2336,19 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
             if (total > max_seen) max_seen = total;
             if (max_seen > 0 and total == 0) {
                 if (json) {
-                    try writeWaitJsonSummary(stdout, target, seen_names.items.len, null);
+                    var summaries: std.ArrayList(WaitJsonSession) = .empty;
+                    defer summaries.deinit(alloc);
+                    for (seen_names.items) |session_name| {
+                        try summaries.append(alloc, .{
+                            .name = session_name,
+                            .completed = true,
+                            .state = "exited",
+                            .health = null,
+                            .task_exit_code = null,
+                        });
+                    }
+                    try writeWaitJsonSummary(stdout, target, summaries.items, null);
+                    try stdout.flush();
                 } else {
                     try stdout.print("sessions exited\n", .{});
                     try stdout.flush();
@@ -2288,7 +2365,8 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
             zero_match_iters += 1;
             if (zero_match_iters >= 3) {
                 if (json) {
-                    try writeJsonError(stdout, "no_matching_sessions", "no matching sessions found");
+                    try writeWaitJsonError(stdout, "no_matching_sessions", "no matching sessions found", target, session_names.items);
+                    try stdout.flush();
                 } else {
                     try stderr.print("error: no matching sessions found\n", .{});
                     try stderr.flush();
@@ -3054,6 +3132,57 @@ test "buildSetMetaPayload joins key and value json" {
     try std.testing.expectEqualStrings("alias", payload[0..5]);
     try std.testing.expectEqual(@as(u8, 0), payload[5]);
     try std.testing.expectEqualStrings("\"controller\"", payload[6..]);
+}
+
+test "base64EncodeAlloc encodes raw bytes for history json" {
+    const alloc = std.testing.allocator;
+    const encoded = try base64EncodeAlloc(alloc, "hello\n");
+    defer alloc.free(encoded);
+
+    try std.testing.expectEqualStrings("aGVsbG8K", encoded);
+}
+
+test "writeWaitJsonSummary includes matched sessions" {
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(alloc);
+
+    const sessions = [_]WaitJsonSession{
+        .{ .name = "alpha", .completed = true, .state = "idle", .health = "healthy", .task_exit_code = 0 },
+        .{ .name = "beta", .completed = true, .state = "exited", .health = null, .task_exit_code = null },
+    };
+
+    try writeWaitJsonSummary(buf.writer(alloc), .task_exit, &sessions, 0);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("task-exit", parsed.value.object.get("target").?.string);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("session_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("aggregate_exit_code").?.integer);
+    const json_sessions = parsed.value.object.get("sessions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), json_sessions.len);
+    try std.testing.expectEqualStrings("alpha", json_sessions[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("beta", json_sessions[1].object.get("name").?.string);
+}
+
+test "writeWaitJsonError includes requested sessions" {
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(alloc);
+
+    const requested = [_][]const u8{ "alpha", "beta" };
+    try writeWaitJsonError(buf.writer(alloc), "timeout", "timed out waiting for ready", .ready, &requested);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("ready", parsed.value.object.get("target").?.string);
+    const requested_sessions = parsed.value.object.get("requested_sessions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), requested_sessions.len);
+    try std.testing.expectEqualStrings("alpha", requested_sessions[0].string);
+    try std.testing.expectEqualStrings("beta", requested_sessions[1].string);
+    try std.testing.expectEqualStrings("timeout", parsed.value.object.get("error").?.object.get("code").?.string);
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking

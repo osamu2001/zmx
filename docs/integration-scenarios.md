@@ -47,7 +47,7 @@ zmx history tests --json
 Acceptance points:
 
 - `wait --for task-exit --json` reports the aggregate exit code.
-- The final JSON payload reports the matched session count without emitting progress chatter.
+- The final JSON payload reports the matched sessions explicitly without emitting progress chatter.
 - Failed tasks still keep the same non-zero exit semantics as human mode.
 - Scrollback remains available after the task exits.
 

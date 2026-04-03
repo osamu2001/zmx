@@ -155,7 +155,16 @@ If you are migrating automation away from `attach`, the safest rule is:
   "target": "task-exit",
   "completed": true,
   "session_count": 1,
-  "aggregate_exit_code": 0
+  "aggregate_exit_code": 0,
+  "sessions": [
+    {
+      "name": "tests",
+      "completed": true,
+      "state": "idle",
+      "health": "healthy",
+      "task_exit_code": 0
+    }
+  ]
 }
 ```
 
@@ -163,6 +172,8 @@ JSON-mode errors use the same shape as `info --json`:
 
 ```json
 {
+  "target": "ready",
+  "requested_sessions": ["mayor"],
   "error": {
     "code": "timeout",
     "message": "timed out waiting for ready"

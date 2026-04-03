@@ -56,17 +56,26 @@ This keeps the JSON contract additive and non-lossy even for VT output.
 
 ## Wait semantics
 
-`wait --json` emits one final summary object on success and no progress chatter:
+`wait --json` emits one final structured object on success and no progress chatter:
 
 - `--for ready` completes when the matching sessions are probeable with a live child process.
 - `--for task-exit` completes when the matching task sessions have finished and preserves aggregate exit semantics.
 - `--for session-exit` completes when the matched sessions disappear after first being observed.
+
+Successful payloads include:
+
+- target
+- aggregate exit code when applicable
+- matched session count
+- one `sessions[]` entry per matched session with name, completion state, health, and task exit code
 
 Errors keep the same exit-code contract as human mode:
 
 - timeout: exit 5
 - no matching sessions: exit 2
 - sessions disappeared before completion: exit 1
+
+JSON-mode errors also include the wait target and the requested session names so a controller can attribute the failure.
 
 ## Export status
 
