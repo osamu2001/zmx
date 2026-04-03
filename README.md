@@ -69,13 +69,24 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 Usage: zmx <command> [args]
 
 Commands:
+  create <name> [command...]     Create a session without attaching
   [a]ttach <name> [command...]   Attach to session, creating session if needed
   [r]un <name> [command...]      Send command without attaching, creating session if needed
   [d]etach                       Detach all clients from current session  (ctrl+\ for current client)
-  [l]ist [--short]               List active sessions
+  info <name> [--json]           Show session details
+  input <name> [text...]         Send text input without attaching
+  send-keys <name> <keys...>     Send special keys without attaching
+  set-meta <name> <key> <value>  Store session metadata
+  get-meta <name> [key]          Read session metadata
+  remove-meta <name> <key>       Remove session metadata
+  interrupt <name>               Send SIGINT to the foreground process group
+  signal <name> <sig>            Send a signal to the foreground or session tree
+  stop <name>                    Gracefully stop a session
+  status [name]                  Show operator-oriented health summary
+  [l]ist [--short|--json]        List active sessions
   [k]ill <name>                  Kill a session and all attached clients
-  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
-  [w]ait <name>...               Wait for session tasks to complete
+  [hi]story <name> [--vt|--html|--json] Output session scrollback
+  [w]ait <name>...               Wait for readiness or exit
   [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
   [v]ersion                      Show version information
   [h]elp                         Show this help message
@@ -96,6 +107,84 @@ echo "ls -lah" | zmx r dev  # use stdin to run the command
 zmx r tests go test ./...   # run your tests in the background
 zmx wait tests              # waits for tests to complete
 ```
+
+## lifecycle guide
+
+`zmx` now has three distinct non-overlapping startup shapes:
+
+- `zmx create <name> [command...]` creates the session if needed and returns once it is probeable. Use this for controllers, automation, and idempotent startup.
+- `zmx attach <name> [command...]` is the human-friendly command. It creates the session when missing and immediately attaches your terminal to it.
+- `zmx run <name> [command...]` sends work to a session without attaching. Use this for task-shaped background work, not as a generic replacement for `create`.
+
+If you are migrating automation away from `attach`, the safest rule is:
+
+- use `create` to ensure the runtime exists
+- use `input`, `send-keys`, `signal`, `interrupt`, `stop`, or `wait` for follow-up control
+- reserve `attach` for humans
+
+## machine-readable output
+
+`--json` is the canonical automation surface. The current stable commands are:
+
+- `zmx info <name> --json`
+- `zmx list --json`
+- `zmx get-meta <name> [key] --json`
+- `zmx history <name> --json`
+- `zmx wait <name>... --json`
+
+### `history --json`
+
+`history --json` preserves exact scrollback bytes by returning base64 instead of reformatting terminal output:
+
+```json
+{
+  "name": "mayor",
+  "format": "plain",
+  "encoding": "base64",
+  "content_b64": "bG9nIGxpbmUgMQpsb2cgbGluZSAyCg==",
+  "byte_len": 22
+}
+```
+
+### `wait --json`
+
+`wait --json` suppresses human progress lines and emits one final JSON object on success. Errors still keep the same exit semantics as the human mode, but the payload becomes structured:
+
+```json
+{
+  "target": "task-exit",
+  "completed": true,
+  "session_count": 1,
+  "aggregate_exit_code": 0
+}
+```
+
+JSON-mode errors use the same shape as `info --json`:
+
+```json
+{
+  "error": {
+    "code": "timeout",
+    "message": "timed out waiting for ready"
+  }
+}
+```
+
+## automation and controllers
+
+For a controller-friendly flow, use:
+
+```bash
+zmx create mayor opencode
+zmx set-meta mayor gc_alias mayor
+zmx info mayor --json
+zmx history mayor --json
+zmx wait mayor --for ready --timeout 5s --json
+```
+
+Additional controller notes live in [docs/automation.md](./docs/automation.md), and the acceptance scenarios that back these flows live in [docs/integration-scenarios.md](./docs/integration-scenarios.md).
+
+`export` is intentionally not implemented in this phase. It remains optional backlog work so the current runtime surface can stabilize first.
 
 ## shell prompt
 

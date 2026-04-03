@@ -52,6 +52,30 @@ const WaitTarget = enum {
     ready,
 };
 
+const HistoryJsonPayload = struct {
+    name: []const u8,
+    format: []const u8,
+    encoding: []const u8,
+    content_b64: []const u8,
+    byte_len: usize,
+};
+
+const WaitJsonSession = struct {
+    name: []const u8,
+    completed: bool,
+    state: ?[]const u8,
+    health: ?[]const u8,
+    task_exit_code: ?u8,
+};
+
+const WaitJsonResult = struct {
+    target: []const u8,
+    completed: bool,
+    session_count: usize,
+    aggregate_exit_code: ?u8,
+    sessions: []const WaitJsonSession,
+};
+
 const ReadinessLevel = enum {
     daemon_ready,
     session_ready,
@@ -59,6 +83,22 @@ const ReadinessLevel = enum {
 
 fn currentTimestamp() u64 {
     return @intCast(std.time.timestamp());
+}
+
+fn waitTargetLabel(target: WaitTarget) []const u8 {
+    return switch (target) {
+        .task_exit => "task-exit",
+        .session_exit => "session-exit",
+        .ready => "ready",
+    };
+}
+
+fn historyFormatLabel(format: util.HistoryFormat) []const u8 {
+    return switch (format) {
+        .plain => "plain",
+        .vt => "vt",
+        .html => "html",
+    };
 }
 
 fn exitCodeForError(err: anyerror) u8 {
@@ -321,11 +361,14 @@ fn realMain() !void {
     } else if (std.mem.eql(u8, cmd, "history") or std.mem.eql(u8, cmd, "hi")) {
         var session_name: ?[]const u8 = null;
         var format: util.HistoryFormat = .plain;
+        var json = false;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--vt")) {
                 format = .vt;
             } else if (std.mem.eql(u8, arg, "--html")) {
                 format = .html;
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
             } else if (session_name == null) {
                 session_name = arg;
             }
@@ -333,7 +376,7 @@ fn realMain() !void {
         const sesh_env = socket.getSeshNameFromEnv();
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
-        return history(&cfg, sesh, format);
+        return history(&cfg, sesh, format, json);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
 
@@ -378,6 +421,7 @@ fn realMain() !void {
         }
         var target: WaitTarget = .task_exit;
         var timeout_ms: ?u64 = null;
+        var json = false;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--for")) {
                 const value = args.next() orelse return error.CommandRequired;
@@ -389,12 +433,16 @@ fn realMain() !void {
                 timeout_ms = try parseDurationMillis(value);
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
+                continue;
+            }
 
             const session_name = arg;
             const sesh = try socket.getSeshName(alloc, session_name);
             try args_raw.append(alloc, sesh);
         }
-        return wait(&cfg, args_raw, target, timeout_ms);
+        return wait(&cfg, args_raw, target, timeout_ms, json);
     } else {
         return help();
     }
@@ -1208,6 +1256,14 @@ fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
+fn base64EncodeAlloc(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(payload.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    _ = encoder.encode(encoded, payload);
+    return encoded;
+}
+
 fn buildMetaValueJson(
     alloc: std.mem.Allocator,
     value_parts: []const []const u8,
@@ -1251,6 +1307,40 @@ fn writeRawJsonField(writer: anytype, first: *bool, key: []const u8, raw_json: [
     try writer.print("{f}", .{std.json.fmt(key, .{})});
     try writer.writeByte(':');
     try writer.writeAll(raw_json);
+}
+
+fn waitMatches(session_name: []const u8, prefixes: []const []const u8) bool {
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, session_name, prefix)) return true;
+    }
+    return false;
+}
+
+fn rememberSeenWaitSession(
+    alloc: std.mem.Allocator,
+    seen_names: *std.ArrayList([]u8),
+    session_name: []const u8,
+) !void {
+    for (seen_names.items) |existing| {
+        if (std.mem.eql(u8, existing, session_name)) return;
+    }
+    try seen_names.append(alloc, try alloc.dupe(u8, session_name));
+}
+
+fn writeWaitJsonSummary(
+    writer: anytype,
+    target: WaitTarget,
+    session_count: usize,
+    aggregate_exit_code: ?u8,
+) !void {
+    var first = true;
+    try writer.writeByte('{');
+    try writeJsonField(writer, &first, "target", waitTargetLabel(target));
+    try writeJsonField(writer, &first, "completed", true);
+    try writeJsonField(writer, &first, "session_count", session_count);
+    try writeJsonField(writer, &first, "aggregate_exit_code", aggregate_exit_code);
+    try writer.writeAll("}\n");
+    try writer.flush();
 }
 
 const SessionMetaResult = struct {
@@ -1340,8 +1430,8 @@ fn help() !void {
         \\  status [name]                  Show operator-oriented health summary
         \\  [l]ist [--short|--json]        List active sessions
         \\  [k]ill <name>                  Kill a session and all attached clients
-        \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
-        \\  [w]ait <name>...               Wait for readiness or exit (--for, --timeout)
+        \\  [hi]story <name> [--vt|--html|--json] Output session scrollback (--json returns base64 content)
+        \\  [w]ait <name>...               Wait for readiness or exit (--for, --timeout, --json)
         \\  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
         \\  [v]ersion                      Show version information
         \\  [h]elp                         Show this help message
@@ -1367,7 +1457,10 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
     const alloc = gpa.allocator();
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
@@ -1620,7 +1713,10 @@ fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success
     const alloc = gpa.allocator();
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
@@ -1746,7 +1842,10 @@ fn dispatchSessionControl(cfg: *Cfg, session_name: []const u8, tag: ipc.Tag, pay
     const alloc = gpa.allocator();
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
@@ -2013,7 +2112,7 @@ fn waitForSessionReadiness(cfg: *Cfg, session_name: []const u8, level: Readiness
     return error.SessionNotReady;
 }
 
-fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget, timeout_ms: ?u64) !void {
+fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget, timeout_ms: ?u64, json: bool) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -2031,21 +2130,30 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
     // disappeared" (fail -- daemon crashed or was killed).
     var max_seen: i32 = 0;
     var zero_match_iters: u32 = 0;
+    var seen_names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen_names.items) |name| {
+            alloc.free(name);
+        }
+        seen_names.deinit(alloc);
+    }
     const deadline = if (timeout_ms) |value|
         std.time.milliTimestamp() + @as(i64, @intCast(value))
     else
         null;
-    const target_label = switch (target) {
-        .task_exit => "task-exit",
-        .session_exit => "session-exit",
-        .ready => "ready",
-    };
+    const target_label = waitTargetLabel(target);
 
     while (true) {
         if (deadline) |limit| {
             if (std.time.milliTimestamp() >= limit) {
-                try stderr.print("error: timed out waiting for {s}\n", .{target_label});
-                try stderr.flush();
+                if (json) {
+                    const message = try std.fmt.allocPrint(alloc, "timed out waiting for {s}", .{target_label});
+                    defer alloc.free(message);
+                    try writeJsonError(stdout, "timeout", message);
+                } else {
+                    try stderr.print("error: timed out waiting for {s}\n", .{target_label});
+                    try stderr.flush();
+                }
                 return error.Timeout;
             }
         }
@@ -2056,33 +2164,29 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
         var agg_exit_code: u8 = 0;
 
         for (sessions.items) |session| {
-            var found = false;
-            for (session_names.items) |prefix| {
-                if (std.mem.startsWith(u8, session.name, prefix)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                continue;
-            }
+            if (!waitMatches(session.name, session_names.items)) continue;
 
+            try rememberSeenWaitSession(alloc, &seen_names, session.name);
             total += 1;
             switch (target) {
                 .task_exit => {
                     if (session.is_error) {
-                        try stderr.print(
-                            "task unreachable: {s} ({s})\n",
-                            .{ session.name, session.error_name orelse "unknown" },
-                        );
-                        try stderr.flush();
+                        if (!json) {
+                            try stderr.print(
+                                "task unreachable: {s} ({s})\n",
+                                .{ session.name, session.error_name orelse "unknown" },
+                            );
+                            try stderr.flush();
+                        }
                         agg_exit_code = 1;
                         done += 1;
                         continue;
                     }
                     if (session.task_ended_at == 0) {
-                        try stdout.print("still waiting task={s}\n", .{session.name});
-                        try stdout.flush();
+                        if (!json) {
+                            try stdout.print("still waiting task={s}\n", .{session.name});
+                            try stdout.flush();
+                        }
                         continue;
                     }
                     if (session.task_exit_code != 0) {
@@ -2094,14 +2198,67 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                     if (sessionEntryReady(session)) {
                         done += 1;
                     } else {
-                        try stdout.print("still waiting ready={s}\n", .{session.name});
-                        try stdout.flush();
+                        if (!json) {
+                            try stdout.print("still waiting ready={s}\n", .{session.name});
+                            try stdout.flush();
+                        }
                     }
                 },
                 .session_exit => {
-                    try stdout.print("still waiting session={s}\n", .{session.name});
-                    try stdout.flush();
+                    if (!json) {
+                        try stdout.print("still waiting session={s}\n", .{session.name});
+                        try stdout.flush();
+                    }
                 },
+            }
+        }
+
+        if (target != .session_exit) {
+            // Check disappearance BEFORE completion: if one of N sessions
+            // crashed and the remaining N-1 happen to be done, total==done
+            // would be a false success.
+            if (total < max_seen) {
+                if (json) {
+                    const message = try std.fmt.allocPrint(
+                        alloc,
+                        "{d} session(s) disappeared before completing",
+                        .{max_seen - total},
+                    );
+                    defer alloc.free(message);
+                    try writeJsonError(stdout, "sessions_disappeared", message);
+                } else {
+                    try stderr.print(
+                        "error: {d} session(s) disappeared before completing\n",
+                        .{max_seen - total},
+                    );
+                    try stderr.flush();
+                }
+                std.process.exit(1);
+                return;
+            }
+            max_seen = total;
+
+            if (total > 0 and total == done) {
+                if (json) {
+                    try writeWaitJsonSummary(
+                        stdout,
+                        target,
+                        @intCast(total),
+                        if (target == .task_exit) @as(?u8, agg_exit_code) else null,
+                    );
+                } else {
+                    const success_message = switch (target) {
+                        .task_exit => "tasks completed!",
+                        .ready => "sessions ready",
+                        .session_exit => unreachable,
+                    };
+                    try stdout.print("{s}\n", .{success_message});
+                    try stdout.flush();
+                }
+                if (target == .task_exit and agg_exit_code != 0) {
+                    std.process.exit(agg_exit_code);
+                }
+                return;
             }
         }
 
@@ -2113,35 +2270,11 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
         if (target == .session_exit) {
             if (total > max_seen) max_seen = total;
             if (max_seen > 0 and total == 0) {
-                try stdout.print("sessions exited\n", .{});
-                try stdout.flush();
-                return;
-            }
-        } else {
-            // Check disappearance BEFORE completion: if one of N sessions
-            // crashed and the remaining N-1 happen to be done, total==done
-            // would be a false success.
-            if (total < max_seen) {
-                try stderr.print(
-                    "error: {d} session(s) disappeared before completing\n",
-                    .{max_seen - total},
-                );
-                try stderr.flush();
-                std.process.exit(1);
-                return;
-            }
-            max_seen = total;
-
-            if (total > 0 and total == done) {
-                const success_message = switch (target) {
-                    .task_exit => "tasks completed!",
-                    .ready => "sessions ready",
-                    .session_exit => unreachable,
-                };
-                try stdout.print("{s}\n", .{success_message});
-                try stdout.flush();
-                if (target == .task_exit and agg_exit_code != 0) {
-                    std.process.exit(agg_exit_code);
+                if (json) {
+                    try writeWaitJsonSummary(stdout, target, seen_names.items.len, null);
+                } else {
+                    try stdout.print("sessions exited\n", .{});
+                    try stdout.flush();
                 }
                 return;
             }
@@ -2154,8 +2287,12 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
             // typo, not a slow start.
             zero_match_iters += 1;
             if (zero_match_iters >= 3) {
-                try stderr.print("error: no matching sessions found\n", .{});
-                try stderr.flush();
+                if (json) {
+                    try writeJsonError(stdout, "no_matching_sessions", "no matching sessions found");
+                } else {
+                    try stderr.print("error: no matching sessions found\n", .{});
+                    try stderr.flush();
+                }
                 std.process.exit(2);
                 return;
             }
@@ -2458,13 +2595,14 @@ fn kill(cfg: *Cfg, session_name: []const u8) !void {
     try w.interface.flush();
 }
 
-fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+fn requestHistoryPayload(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) ![]u8 {
+    const alloc = std.heap.c_allocator;
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+            return error.NameTooLong;
+        },
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
@@ -2474,22 +2612,18 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
         return error.SessionNotFound;
     }
     const result = ipc.probeSession(alloc, socket_path) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
-        return;
+        return err;
     };
     defer posix.close(result.fd);
 
     const format_byte = [_]u8{@intFromEnum(format)};
     ipc.send(result.fd, .History, &format_byte) catch |err| switch (err) {
-        error.BrokenPipe, error.ConnectionResetByPeer => return,
+        error.BrokenPipe, error.ConnectionResetByPeer => return err,
         else => return err,
     };
 
@@ -2498,22 +2632,68 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
 
     while (true) {
         var poll_fds = [_]posix.pollfd{.{ .fd = result.fd, .events = posix.POLL.IN, .revents = 0 }};
-        const poll_result = posix.poll(&poll_fds, 5000) catch return;
+        const poll_result = posix.poll(&poll_fds, 5000) catch return error.PollFailed;
         if (poll_result == 0) {
             std.log.err("timeout waiting for history response", .{});
-            return;
+            return error.Timeout;
         }
 
-        const n = sb.read(result.fd) catch return;
-        if (n == 0) return;
+        const n = sb.read(result.fd) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
 
         while (sb.next()) |msg| {
             if (msg.header.tag == .History) {
-                _ = posix.write(posix.STDOUT_FILENO, msg.payload) catch return;
-                return;
+                return try alloc.dupe(u8, msg.payload);
             }
         }
     }
+}
+
+fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat, json: bool) !void {
+    const payload = requestHistoryPayload(cfg, session_name, format) catch |err| {
+        if (err == error.SessionNotFound) {
+            if (json) {
+                var out_buf: [4096]u8 = undefined;
+                var out = std.fs.File.stdout().writer(&out_buf);
+                var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+                defer _ = gpa.deinit();
+                const alloc = gpa.allocator();
+                const message = try std.fmt.allocPrint(alloc, "session '{s}' not found", .{session_name});
+                defer alloc.free(message);
+                try writeJsonError(&out.interface, "session_not_found", message);
+            } else {
+                var buf: [4096]u8 = undefined;
+                var w = std.fs.File.stderr().writer(&buf);
+                w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
+                w.interface.flush() catch {};
+            }
+        }
+        return err;
+    };
+    defer std.heap.c_allocator.free(payload);
+
+    if (!json) {
+        _ = posix.write(posix.STDOUT_FILENO, payload) catch return;
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    const content_b64 = try base64EncodeAlloc(alloc, payload);
+    defer alloc.free(content_b64);
+
+    const result: HistoryJsonPayload = .{
+        .name = session_name,
+        .format = historyFormatLabel(format),
+        .encoding = "base64",
+        .content_b64 = content_b64,
+        .byte_len = payload.len,
+    };
+    var out_buf: [4096]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&out_buf);
+    try out.interface.print("{f}\n", .{std.json.fmt(result, .{})});
+    try out.interface.flush();
 }
 
 fn attach(daemon: *Daemon) !void {

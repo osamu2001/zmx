@@ -66,10 +66,13 @@ const bash_completions =
     \\      COMPREPLY=($(compgen -W "--timeout-ms --escalate --best-effort" -- "$cur"))
     \\      ;;
     \\    wait)
-    \\      COMPREPLY=($(compgen -W "--for --timeout ready task-exit session-exit" -- "$cur"))
+    \\      COMPREPLY=($(compgen -W "--for --timeout --json ready task-exit session-exit" -- "$cur"))
     \\      ;;
     \\    list)
     \\      COMPREPLY=($(compgen -W "--short --json" -- "$cur"))
+    \\      ;;
+    \\    history)
+    \\      COMPREPLY=($(compgen -W "--vt --html --json" -- "$cur"))
     \\      ;;
     \\    *)
     \\      ;;
@@ -145,10 +148,13 @@ const zsh_completions =
     \\          _values 'options' '--timeout-ms' '--escalate' '--best-effort'
     \\          ;;
     \\        wait|w)
-    \\          _values 'options' '--for' '--timeout' 'ready' 'task-exit' 'session-exit'
+    \\          _values 'options' '--for' '--timeout' '--json' 'ready' 'task-exit' 'session-exit'
     \\          ;;
     \\        list|l)
     \\          _values 'options' '--short' '--json'
+    \\          ;;
+    \\        history|hi)
+    \\          _values 'options' '--vt' '--html' '--json'
     \\          ;;
     \\      esac
     \\      ;;
@@ -218,11 +224,13 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from stop" -l best-effort -d 'Ignore missing target'
     \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -l for -d 'Wait target'
     \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -l timeout -d 'Wait timeout (e.g. 500ms, 2s)'
+    \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -l json -d 'JSON output'
     \\complete -c zmx -n "__fish_seen_subcommand_from w wait" -a 'ready task-exit session-exit' -d 'Wait target'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l json -d 'JSON output'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
+    \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l json -d 'JSON output'
 ;
 
 test "completion scripts include create command" {
@@ -284,4 +292,13 @@ test "completion scripts include list json flag" {
     try std.testing.expect(std.mem.indexOf(u8, bash_completions, "--short --json") != null);
     try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "'--json'") != null);
     try std.testing.expect(std.mem.indexOf(u8, fish_completions, "-l json -d 'JSON output'") != null);
+}
+
+test "completion scripts include history and wait json flags" {
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "--vt --html --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash_completions, "--for --timeout --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "history|hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zsh_completions, "wait|w") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "__fish_seen_subcommand_from hi history\" -l json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fish_completions, "__fish_seen_subcommand_from w wait\" -l json") != null);
 }
