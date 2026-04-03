@@ -193,7 +193,7 @@ zmx history mayor --json
 zmx wait mayor --for ready --timeout 5s --json
 ```
 
-Additional controller notes live in [docs/automation.md](./docs/automation.md), and the acceptance scenarios that back these flows live in [docs/integration-scenarios.md](./docs/integration-scenarios.md).
+The interactive guide lives in [docs/interactive-use.md](./docs/interactive-use.md). Additional controller notes live in [docs/automation.md](./docs/automation.md), and the acceptance scenarios that back these flows live in [docs/integration-scenarios.md](./docs/integration-scenarios.md).
 
 `export` is intentionally not implemented in this phase. It remains optional backlog work so the current runtime surface can stabilize first.
 
