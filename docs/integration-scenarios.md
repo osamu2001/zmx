@@ -2,6 +2,8 @@
 
 This document turns the Phase 4 runtime surface into concrete acceptance scenarios.
 
+These scenarios are also exercised by `tests/spec-runtime-smoke.sh`, which runs from `zig build test`.
+
 ## Coverage map
 
 | Scenario | Commands under test | Contract focus |

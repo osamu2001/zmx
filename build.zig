@@ -72,6 +72,10 @@ pub fn build(b: *std.Build) void {
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    const spec_smoke = b.addSystemCommand(&.{ "sh", "tests/spec-runtime-smoke.sh" });
+    spec_smoke.addFileArg(exe.getEmittedBin());
+    test_step.dependOn(&spec_smoke.step);
+
     // This is where the interesting part begins.
     // As you can see we are re-defining the same executable but
     // we're binding it to a dedicated build step.
