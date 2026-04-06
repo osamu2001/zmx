@@ -23,6 +23,25 @@ assert_contains() {
   printf '%s' "$value" | grep -F "$needle" >/dev/null
 }
 
+assert_fails_with_code() {
+  expected_code=$1
+  pattern=$2
+  shift 2
+  output_file=$(mktemp "$TMPDIR_SPEC/cmd-fail.XXXXXX")
+  set +e
+  "$ZMX_BIN" "$@" > "$output_file" 2>&1
+  status=$?
+  set -e
+  output=$(cat "$output_file")
+  rm -f "$output_file"
+  if [ "$status" -ne "$expected_code" ]; then
+    printf '%s\n' "expected exit code ${expected_code}, got ${status}: ${*}" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+  assert_contains "$output" "$pattern"
+}
+
 extract_json_number() {
   printf '%s' "$1" | tr -d '\n' | grep -o "\"$2\":[0-9]*" | head -n 1 | cut -d: -f2
 }
@@ -100,3 +119,6 @@ printf '%s' "$LONG_OUTPUT_JSON" | grep -E '"byte_len":[1-9][0-9]+' >/dev/null
 
 MISSING_JSON=$("$ZMX_BIN" wait missing --for ready --timeout 200ms --json || true)
 assert_contains "$MISSING_JSON" '"requested_sessions":["missing"]'
+
+assert_fails_with_code 3 "error: session \"missing\" does not exist" kill missing
+assert_fails_with_code 6 "error: unsupported signal \"banana\"" signal missing banana

@@ -105,6 +105,8 @@ fn exitCodeForError(err: anyerror) u8 {
     return switch (err) {
         error.SessionNotFound, error.MetaKeyNotFound => @intFromEnum(ExitCode.not_found),
         error.Timeout, error.SessionNotReady => @intFromEnum(ExitCode.timeout),
+        error.NoMatchingSessions => @intFromEnum(ExitCode.usage_error),
+        error.SessionsDisappeared => @intFromEnum(ExitCode.operational_failure),
         error.SessionNameRequired,
         error.InvalidSessionName,
         error.NameTooLong,
@@ -112,9 +114,11 @@ fn exitCodeForError(err: anyerror) u8 {
         error.CommandRequired,
         error.InvalidKeyName,
         error.UnsupportedSignal,
+        error.UnsupportedSignalTarget,
+        error.SessionAlreadyExists,
+        => @intFromEnum(ExitCode.unsupported),
         error.CannotAttachToSessionInSession,
         => @intFromEnum(ExitCode.usage_error),
-        error.UnsupportedSignalTarget => @intFromEnum(ExitCode.unsupported),
         else => @intFromEnum(ExitCode.operational_failure),
     };
 }
@@ -1230,6 +1234,21 @@ fn writeJsonError(writer: anytype, code: []const u8, message: []const u8) !void 
     try writer.flush();
 }
 
+fn writeSessionNotFound(writer: anytype, alloc: std.mem.Allocator, session_name: []const u8, json: bool) !void {
+    var errbuf: [4096]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&errbuf);
+
+    if (json) {
+        const message = try std.fmt.allocPrint(alloc, "session '{s}' not found", .{session_name});
+        defer alloc.free(message);
+        try writeJsonError(writer, "session_not_found", message);
+        return;
+    }
+
+    w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
+    w.interface.flush() catch {};
+}
+
 fn formatTimestampUtc(alloc: std.mem.Allocator, timestamp: u64) ![]u8 {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = timestamp };
     const epoch_day = epoch_seconds.getEpochDay();
@@ -1545,18 +1564,9 @@ fn info(cfg: *Cfg, session_name: []const u8, json: bool) !void {
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        if (json) {
-            var out_buf: [4096]u8 = undefined;
-            var out = std.fs.File.stdout().writer(&out_buf);
-            const message = try std.fmt.allocPrint(alloc, "session '{s}' not found", .{session_name});
-            defer alloc.free(message);
-            try writeJsonError(&out.interface, "session_not_found", message);
-        } else {
-            var errbuf: [4096]u8 = undefined;
-            var w = std.fs.File.stderr().writer(&errbuf);
-            w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-            w.interface.flush() catch {};
-        }
+        var out_buf: [4096]u8 = undefined;
+        var out = std.fs.File.stdout().writer(&out_buf);
+        try writeSessionNotFound(&out.interface, alloc, session_name, json);
         return error.SessionNotFound;
     }
 
@@ -1801,10 +1811,9 @@ fn sendPayload(cfg: *Cfg, session_name: []const u8, payload: []const u8, success
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
+        var out_buf: [4096]u8 = undefined;
+        var out = std.fs.File.stdout().writer(&out_buf);
+        try writeSessionNotFound(&out.interface, alloc, session_name, false);
         return error.SessionNotFound;
     }
 
@@ -1930,10 +1939,9 @@ fn dispatchSessionControl(cfg: *Cfg, session_name: []const u8, tag: ipc.Tag, pay
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
+        var out_buf: [4096]u8 = undefined;
+        var out = std.fs.File.stdout().writer(&out_buf);
+        try writeSessionNotFound(&out.interface, alloc, session_name, false);
         return error.SessionNotFound;
     }
 
@@ -2064,10 +2072,9 @@ fn status(cfg: *Cfg, session_name: ?[]const u8) !void {
 
         const exists = try socket.sessionExists(dir, name);
         if (!exists) {
-            var errbuf: [4096]u8 = undefined;
-            var stderr = std.fs.File.stderr().writer(&errbuf);
-            stderr.interface.print("error: session \"{s}\" does not exist\n", .{name}) catch {};
-            stderr.interface.flush() catch {};
+            var session_not_found_buf: [4096]u8 = undefined;
+            var session_not_found_writer = std.fs.File.stdout().writer(&session_not_found_buf);
+            try writeSessionNotFound(&session_not_found_writer.interface, alloc, name, false);
             return error.SessionNotFound;
         }
 
@@ -2310,8 +2317,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                     );
                     try stderr.flush();
                 }
-                std.process.exit(1);
-                return;
+                return error.SessionsDisappeared;
             }
             max_seen = total;
 
@@ -2384,8 +2390,7 @@ fn wait(cfg: *Cfg, session_names: std.ArrayList([]const u8), target: WaitTarget,
                     try stderr.print("error: no matching sessions found\n", .{});
                     try stderr.flush();
                 }
-                std.process.exit(2);
-                return;
+                return error.NoMatchingSessions;
             }
         }
 
@@ -2652,10 +2657,9 @@ fn kill(cfg: *Cfg, session_name: []const u8) !void {
 
     const exists = try socket.sessionExists(dir, session_name);
     if (!exists) {
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
-        w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-        w.interface.flush() catch {};
+        var out_buf: [4096]u8 = undefined;
+        var out = std.fs.File.stdout().writer(&out_buf);
+        try writeSessionNotFound(&out.interface, alloc, session_name, false);
         return error.SessionNotFound;
     }
     const result = ipc.probeSession(alloc, socket_path) catch |err| {
@@ -2743,21 +2747,9 @@ fn requestHistoryPayload(cfg: *Cfg, session_name: []const u8, format: util.Histo
 fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat, json: bool) !void {
     const payload = requestHistoryPayload(cfg, session_name, format) catch |err| {
         if (err == error.SessionNotFound) {
-            if (json) {
-                var out_buf: [4096]u8 = undefined;
-                var out = std.fs.File.stdout().writer(&out_buf);
-                var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-                defer _ = gpa.deinit();
-                const alloc = gpa.allocator();
-                const message = try std.fmt.allocPrint(alloc, "session '{s}' not found", .{session_name});
-                defer alloc.free(message);
-                try writeJsonError(&out.interface, "session_not_found", message);
-            } else {
-                var buf: [4096]u8 = undefined;
-                var w = std.fs.File.stderr().writer(&buf);
-                w.interface.print("error: session \"{s}\" does not exist\n", .{session_name}) catch {};
-                w.interface.flush() catch {};
-            }
+            var out_buf: [4096]u8 = undefined;
+            var out = std.fs.File.stdout().writer(&out_buf);
+            try writeSessionNotFound(&out.interface, std.heap.c_allocator, session_name, json);
         }
         return err;
     };
