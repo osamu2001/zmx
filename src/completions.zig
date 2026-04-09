@@ -106,9 +106,23 @@ const zsh_completions =
     \\        attach|a|kill|k|run|r|history|hi)
     \\          _zmx_sessions
     \\          ;;
-    \\        info|send|send-keys)
+    \\        info)
     \\          if (( CURRENT == 3 )); then
     \\            _zmx_sessions
+    \\          else
+    \\            _values 'options' '--json'
+    \\          fi
+    \\          ;;
+    \\        send)
+    \\          if (( CURRENT == 3 )); then
+    \\            _zmx_sessions
+    \\          fi
+    \\          ;;
+    \\        send-keys)
+    \\          if (( CURRENT == 3 )); then
+    \\            _zmx_sessions
+    \\          elif (( CURRENT >= 4 )); then
+    \\            _values 'keys' 'Enter' 'Escape' 'C-c' 'Tab' 'Up' 'Down' 'Left' 'Right'
     \\          fi
     \\          ;;
     \\        completions|c)
@@ -116,14 +130,6 @@ const zsh_completions =
     \\          ;;
     \\        list|l)
     \\          _values 'options' '--short'
-    \\          ;;
-    \\        send-keys)
-    \\          if (( CURRENT >= 4 )); then
-    \\            _values 'keys' 'Enter' 'Escape' 'C-c' 'Tab' 'Up' 'Down' 'Left' 'Right'
-    \\          fi
-    \\          ;;
-    \\        info)
-    \\          _values 'options' '--json'
     \\          ;;
     \\      esac
     \\      ;;
