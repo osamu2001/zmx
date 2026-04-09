@@ -36,14 +36,24 @@ const bash_completions =
     \\    return 0
     \\  fi
     \\
+    \\  local cmd="${COMP_WORDS[1]}"
+    \\  if [[ $COMP_CWORD -eq 2 ]]; then
+    \\    case "$cmd" in
+    \\      attach|run|kill|history|info|send|send-keys)
+    \\        local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
+    \\        COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
+    \\        return 0
+    \\        ;;
+    \\    esac
+    \\  fi
+    \\
     \\  case "$prev" in
-    \\    attach|run|kill|history|info|send|send-keys)
-    \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
-    \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
-    \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
     \\      ;;
+    \\  esac
+    \\
+    \\  case "$cmd" in
     \\    list)
     \\      COMPREPLY=($(compgen -W "--short" -- "$cur"))
     \\      ;;
@@ -93,8 +103,13 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|history|hi|info|send|send-keys)
+    \\        attach|a|kill|k|run|r|history|hi)
     \\          _zmx_sessions
+    \\          ;;
+    \\        info|send|send-keys)
+    \\          if (( CURRENT == 3 )); then
+    \\            _zmx_sessions
+    \\          fi
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
@@ -103,7 +118,7 @@ const zsh_completions =
     \\          _values 'options' '--short'
     \\          ;;
     \\        send-keys)
-    \\          if (( CURRENT == 4 )); then
+    \\          if (( CURRENT >= 4 )); then
     \\            _values 'keys' 'Enter' 'Escape' 'C-c' 'Tab' 'Up' 'Down' 'Left' 'Right'
     \\          fi
     \\          ;;
