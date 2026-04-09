@@ -73,6 +73,9 @@ Commands:
   [r]un <name> [command...]      Send command without attaching, creating session if needed
   [d]etach                       Detach all clients from current session  (ctrl+\ for current client)
   [l]ist [--short]               List active sessions
+  info <name> [--json]           Show metadata for one session
+  send <name>                    Send raw stdin bytes to an existing session
+  send-keys <name> <key>...      Send symbolic key presses to an existing session
   [k]ill <name>... [--force]     Kill a session and all attached clients
   [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
   [w]ait <name>...               Wait for session tasks to complete
@@ -92,6 +95,10 @@ zmx attach mux dvtm         # run a multiplexer inside zmx
 zmx run dev cat README.md   # run the command without attaching to the session
 zmx r dev cat CHANGELOG.md  # alias
 echo "ls -lah" | zmx r dev  # use stdin to run the command
+
+zmx info dev --json         # fetch machine-readable metadata for one session
+printf 'echo hi\r' | zmx send dev
+zmx send-keys dev C-c       # send ctrl-c to the foreground process
 
 zmx r tests go test ./...   # run your tests in the background
 zmx wait tests              # waits for tests to complete

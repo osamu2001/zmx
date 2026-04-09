@@ -25,7 +25,83 @@ pub const SessionEntry = struct {
     pub fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
         return std.mem.order(u8, a.name, b.name) == .lt;
     }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("pid");
+        try jw.write(self.pid);
+        try jw.objectField("clients");
+        try jw.write(self.clients_len);
+        try jw.objectField("cwd");
+        try jw.write(self.cwd);
+        try jw.objectField("cmd");
+        try jw.write(self.cmd);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("task_ended_at");
+        try jw.write(self.task_ended_at);
+        try jw.objectField("task_exit_code");
+        try jw.write(self.task_exit_code);
+        try jw.objectField("is_error");
+        try jw.write(self.is_error);
+        try jw.objectField("error");
+        try jw.write(self.error_name);
+        try jw.endObject();
+    }
 };
+
+pub fn sessionEntryFromInfo(
+    alloc: std.mem.Allocator,
+    session_name: []const u8,
+    info: ipc.Info,
+) !SessionEntry {
+    const name = try alloc.dupe(u8, session_name);
+    errdefer alloc.free(name);
+
+    const cmd_len = @min(info.cmd_len, ipc.MAX_CMD_LEN);
+    const cwd_len = @min(info.cwd_len, ipc.MAX_CWD_LEN);
+    const cmd: ?[]const u8 = if (cmd_len > 0)
+        try alloc.dupe(u8, info.cmd[0..cmd_len])
+    else
+        null;
+    errdefer if (cmd) |v| alloc.free(v);
+
+    const cwd: ?[]const u8 = if (cwd_len > 0)
+        try alloc.dupe(u8, info.cwd[0..cwd_len])
+    else
+        null;
+    errdefer if (cwd) |v| alloc.free(v);
+
+    const task_ended_at: ?u64 = if (info.task_ended_at > 0) info.task_ended_at else null;
+    const task_exit_code: ?u8 = if (task_ended_at != null) info.task_exit_code else null;
+
+    return .{
+        .name = name,
+        .pid = info.pid,
+        .clients_len = info.clients_len,
+        .is_error = false,
+        .error_name = null,
+        .cmd = cmd,
+        .cwd = cwd,
+        .created_at = info.created_at,
+        .task_ended_at = task_ended_at,
+        .task_exit_code = task_exit_code,
+    };
+}
+
+pub fn sendKeyBytes(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "Enter")) return "\r";
+    if (std.mem.eql(u8, name, "Escape")) return "\x1b";
+    if (std.mem.eql(u8, name, "C-c")) return "\x03";
+    if (std.mem.eql(u8, name, "Tab")) return "\t";
+    if (std.mem.eql(u8, name, "Up")) return "\x1b[A";
+    if (std.mem.eql(u8, name, "Down")) return "\x1b[B";
+    if (std.mem.eql(u8, name, "Left")) return "\x1b[D";
+    if (std.mem.eql(u8, name, "Right")) return "\x1b[C";
+    return null;
+}
 
 pub fn get_session_entries(
     alloc: std.mem.Allocator,
@@ -70,31 +146,8 @@ pub fn get_session_entries(
             };
             posix.close(result.fd);
 
-            // Extract cmd and cwd from the fixed-size arrays. Lengths come
-            // off the wire (u16 range), so clamp to the actual array size.
-            const cmd_len = @min(result.info.cmd_len, ipc.MAX_CMD_LEN);
-            const cwd_len = @min(result.info.cwd_len, ipc.MAX_CWD_LEN);
-            const cmd: ?[]const u8 = if (cmd_len > 0)
-                alloc.dupe(u8, result.info.cmd[0..cmd_len]) catch null
-            else
-                null;
-            const cwd: ?[]const u8 = if (cwd_len > 0)
-                alloc.dupe(u8, result.info.cwd[0..cwd_len]) catch null
-            else
-                null;
-
-            try sessions.append(alloc, .{
-                .name = name,
-                .pid = result.info.pid,
-                .clients_len = result.info.clients_len,
-                .is_error = false,
-                .error_name = null,
-                .cmd = cmd,
-                .cwd = cwd,
-                .created_at = result.info.created_at,
-                .task_ended_at = result.info.task_ended_at,
-                .task_exit_code = result.info.task_exit_code,
-            });
+            alloc.free(name);
+            try sessions.append(alloc, try sessionEntryFromInfo(alloc, entry.name, result.info));
         }
     }
 
@@ -528,6 +581,78 @@ test "writeSessionLine formats output for current session and short output" {
         try writeSessionLine(&builder.writer, case.session, case.short, case.current_session);
         try std.testing.expectEqualStrings(case.expected, builder.writer.buffered());
     }
+}
+
+test "sessionEntryFromInfo copies metadata and normalizes task fields" {
+    const alloc = std.testing.allocator;
+    var cmd = [_]u8{0} ** ipc.MAX_CMD_LEN;
+    @memcpy(cmd[0.."echo hi".len], "echo hi");
+
+    var cwd = [_]u8{0} ** ipc.MAX_CWD_LEN;
+    @memcpy(cwd[0.."/tmp".len], "/tmp");
+
+    const info = ipc.Info{
+        .clients_len = 2,
+        .pid = 123,
+        .cmd_len = "echo hi".len,
+        .cwd_len = 4,
+        .cmd = cmd,
+        .cwd = cwd,
+        .created_at = 42,
+        .task_ended_at = 0,
+        .task_exit_code = 7,
+    };
+
+    const entry = try sessionEntryFromInfo(alloc, "demo", info);
+    defer entry.deinit(alloc);
+
+    try std.testing.expectEqualStrings("demo", entry.name);
+    try std.testing.expectEqual(@as(?i32, 123), entry.pid);
+    try std.testing.expectEqual(@as(?usize, 2), entry.clients_len);
+    try std.testing.expectEqualStrings("echo hi", entry.cmd.?);
+    try std.testing.expectEqualStrings("/tmp", entry.cwd.?);
+    try std.testing.expectEqual(@as(u64, 42), entry.created_at);
+    try std.testing.expectEqual(@as(?u64, null), entry.task_ended_at);
+    try std.testing.expectEqual(@as(?u8, null), entry.task_exit_code);
+}
+
+test "SessionEntry jsonStringify emits machine-readable shape" {
+    const alloc = std.testing.allocator;
+    var entry = SessionEntry{
+        .name = try alloc.dupe(u8, "demo"),
+        .pid = 123,
+        .clients_len = 2,
+        .is_error = false,
+        .error_name = null,
+        .cmd = try alloc.dupe(u8, "echo hi"),
+        .cwd = try alloc.dupe(u8, "/tmp/demo"),
+        .created_at = 42,
+        .task_ended_at = 50,
+        .task_exit_code = 0,
+    };
+    defer entry.deinit(alloc);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    try jw.write(entry);
+
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"demo\",\"pid\":123,\"clients\":2,\"cwd\":\"/tmp/demo\",\"cmd\":\"echo hi\",\"created_at\":42,\"task_ended_at\":50,\"task_exit_code\":0,\"is_error\":false,\"error\":null}",
+        out.writer.buffered(),
+    );
+}
+
+test "sendKeyBytes maps supported key names" {
+    try std.testing.expectEqualStrings("\r", sendKeyBytes("Enter").?);
+    try std.testing.expectEqualStrings("\x1b", sendKeyBytes("Escape").?);
+    try std.testing.expectEqualStrings("\x03", sendKeyBytes("C-c").?);
+    try std.testing.expectEqualStrings("\t", sendKeyBytes("Tab").?);
+    try std.testing.expectEqualStrings("\x1b[A", sendKeyBytes("Up").?);
+    try std.testing.expectEqualStrings("\x1b[B", sendKeyBytes("Down").?);
+    try std.testing.expectEqualStrings("\x1b[D", sendKeyBytes("Left").?);
+    try std.testing.expectEqualStrings("\x1b[C", sendKeyBytes("Right").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), sendKeyBytes("Space"));
 }
 
 test "shellNeedsQuoting" {

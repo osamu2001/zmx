@@ -69,6 +69,35 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
         const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
         return list(&cfg, short);
+    } else if (std.mem.eql(u8, cmd, "info")) {
+        var session_name: ?[]const u8 = null;
+        var as_json = false;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--json")) {
+                as_json = true;
+            } else if (session_name == null) {
+                session_name = arg;
+            } else {
+                return error.InvalidArgument;
+            }
+        }
+        const sesh = try socket.getSeshName(alloc, session_name orelse "");
+        defer alloc.free(sesh);
+        return info(&cfg, sesh, as_json);
+    } else if (std.mem.eql(u8, cmd, "send")) {
+        const sesh = try socket.getSeshName(alloc, args.next() orelse "");
+        defer alloc.free(sesh);
+        return sendStdin(&cfg, alloc, sesh);
+    } else if (std.mem.eql(u8, cmd, "send-keys")) {
+        const sesh = try socket.getSeshName(alloc, args.next() orelse "");
+        defer alloc.free(sesh);
+
+        var key_names: std.ArrayList([]const u8) = .empty;
+        defer key_names.deinit(alloc);
+        while (args.next()) |arg| {
+            try key_names.append(alloc, arg);
+        }
+        return sendKeys(&cfg, alloc, sesh, key_names.items);
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse return;
         const shell = completions.Shell.fromString(arg) orelse return;
@@ -819,7 +848,7 @@ const Daemon = struct {
         const cwd_len: u16 = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
         @memcpy(cwd_buf[0..cwd_len], self.cwd[0..cwd_len]);
 
-        const info = ipc.Info{
+        const info_msg = ipc.Info{
             .clients_len = clients_len,
             .pid = self.pid,
             .cmd_len = cmd_len,
@@ -830,7 +859,7 @@ const Daemon = struct {
             .task_ended_at = self.task_ended_at orelse 0,
             .task_exit_code = self.task_exit_code orelse 0,
         };
-        try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info));
+        try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info_msg));
         client.has_pending_output = true;
     }
 
@@ -870,6 +899,126 @@ const Daemon = struct {
     }
 };
 
+const SessionAccessError = error{
+    SessionNotFound,
+    SessionUnreachable,
+};
+
+fn getSessionSocketPath(
+    alloc: std.mem.Allocator,
+    cfg: *Cfg,
+    session_name: []const u8,
+) ![]const u8 {
+    return socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
+        error.NameTooLong => {
+            socket.printSessionNameTooLong(session_name, cfg.socket_dir);
+            return err;
+        },
+        error.OutOfMemory => return err,
+    };
+}
+
+fn probeSessionByName(
+    alloc: std.mem.Allocator,
+    cfg: *Cfg,
+    session_name: []const u8,
+) !ipc.SessionProbeResult {
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    if (!(try socket.sessionExists(dir, session_name))) {
+        return error.SessionNotFound;
+    }
+
+    const socket_path = try getSessionSocketPath(alloc, cfg, session_name);
+    defer alloc.free(socket_path);
+
+    return ipc.probeSession(alloc, socket_path) catch |err| {
+        if (err == error.ConnectionRefused) {
+            socket.cleanupStaleSocket(dir, session_name);
+        }
+        return error.SessionUnreachable;
+    };
+}
+
+fn readStdinAlloc(alloc: std.mem.Allocator) ![]u8 {
+    var stdin_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+    defer stdin_buf.deinit(alloc);
+
+    while (true) {
+        var tmp: [4096]u8 = undefined;
+        const n = posix.read(posix.STDIN_FILENO, &tmp) catch |err| {
+            if (err == error.WouldBlock) break;
+            return err;
+        };
+        if (n == 0) break;
+        try stdin_buf.appendSlice(alloc, tmp[0..n]);
+    }
+
+    return stdin_buf.toOwnedSlice(alloc);
+}
+
+fn sendBytesToSession(
+    alloc: std.mem.Allocator,
+    cfg: *Cfg,
+    session_name: []const u8,
+    payload: []const u8,
+) !void {
+    const probe = try probeSessionByName(alloc, cfg, session_name);
+    defer posix.close(probe.fd);
+
+    ipc.send(probe.fd, .Input, payload) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return error.SessionUnreachable,
+        else => return err,
+    };
+}
+
+fn info(cfg: *Cfg, session_name: []const u8, as_json: bool) !void {
+    const alloc = std.heap.c_allocator;
+    var entry = blk: {
+        const probe = try probeSessionByName(alloc, cfg, session_name);
+        defer posix.close(probe.fd);
+        break :blk try util.sessionEntryFromInfo(alloc, session_name, probe.info);
+    };
+    defer entry.deinit(alloc);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&stdout_buf);
+    if (as_json) {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        try jw.write(entry);
+        try stdout.interface.print("{s}", .{out.writer.buffered()});
+    } else {
+        try util.writeSessionLine(&stdout.interface, entry, false, null);
+    }
+    try stdout.interface.flush();
+}
+
+fn sendStdin(cfg: *Cfg, alloc: std.mem.Allocator, session_name: []const u8) !void {
+    const payload = try readStdinAlloc(alloc);
+    defer alloc.free(payload);
+    try sendBytesToSession(alloc, cfg, session_name, payload);
+}
+
+fn sendKeys(cfg: *Cfg, alloc: std.mem.Allocator, session_name: []const u8, key_names: [][]const u8) !void {
+    if (key_names.len == 0) return error.InvalidArgument;
+
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(alloc);
+
+    for (key_names) |key_name| {
+        const bytes = util.sendKeyBytes(key_name) orelse {
+            std.log.err("unknown key name: {s}", .{key_name});
+            return error.InvalidArgument;
+        };
+        try payload.appendSlice(alloc, bytes);
+    }
+
+    try sendBytesToSession(alloc, cfg, session_name, payload.items);
+}
+
 fn printVersion(cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -903,6 +1052,9 @@ fn help() !void {
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
+        \\  info <name> [--json]           Show metadata for one session
+        \\  send <name>                    Send raw stdin bytes to an existing session
+        \\  send-keys <name> <key>...      Send symbolic key presses to an existing session
         \\  [k]ill <name>... [--force]     Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [w]ait <name>...               Wait for session tasks to complete
