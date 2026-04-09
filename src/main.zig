@@ -899,11 +899,6 @@ const Daemon = struct {
     }
 };
 
-const SessionAccessError = error{
-    SessionNotFound,
-    SessionUnreachable,
-};
-
 fn getSessionSocketPath(
     alloc: std.mem.Allocator,
     cfg: *Cfg,

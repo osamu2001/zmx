@@ -116,9 +116,6 @@ pub fn get_session_entries(
     while (try iter.next()) |entry| {
         const exists = socket.sessionExists(dir, entry.name) catch continue;
         if (exists) {
-            const name = try alloc.dupe(u8, entry.name);
-            errdefer alloc.free(name);
-
             const socket_path = socket.getSocketPath(alloc, socket_dir, entry.name) catch |err| switch (err) {
                 error.NameTooLong => continue,
                 error.OutOfMemory => return err,
@@ -127,7 +124,7 @@ pub fn get_session_entries(
 
             const result = ipc.probeSession(alloc, socket_path) catch |err| {
                 try sessions.append(alloc, .{
-                    .name = name,
+                    .name = try alloc.dupe(u8, entry.name),
                     .pid = null,
                     .clients_len = null,
                     .is_error = true,
@@ -146,7 +143,6 @@ pub fn get_session_entries(
             };
             posix.close(result.fd);
 
-            alloc.free(name);
             try sessions.append(alloc, try sessionEntryFromInfo(alloc, entry.name, result.info));
         }
     }
