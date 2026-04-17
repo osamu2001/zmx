@@ -183,12 +183,9 @@ pub fn main() !void {
 
         var cmd_args_raw: std.ArrayList([]const u8) = .empty;
         defer cmd_args_raw.deinit(alloc);
-        const shell = util.detectShell();
-        var shell_basename = std.fs.path.basename(shell);
+        var shell_basename: []const u8 = "bash";
         var detached = false;
         while (args.next()) |arg| {
-            // TODO: detect shell within the session instead of asking the user to tell us
-            // if the shell is fish.
             // Because fish tracks exit code status via $status instead of $? we need some
             // way to figure out what shell is being used inside the session.
             if (std.mem.startsWith(u8, arg, "--fish")) {
@@ -1106,9 +1103,6 @@ const Daemon = struct {
             defer self.alloc.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            // Bracketed paste mode so the shell buffers input
-            // rather than processing each keystroke individually.
-            self.queuePtyInput("\x1b[200~");
             self.queuePtyInput("printf '%s' '");
             self.queuePtyInput(encoded);
             if (is_first) {
@@ -1118,7 +1112,6 @@ const Daemon = struct {
             }
             self.queuePtyInput(file_path);
             self.queuePtyInput("'");
-            self.queuePtyInput("\x1b[201~");
             self.queuePtyInput("\r");
 
             offset = end;
@@ -1311,17 +1304,20 @@ fn help() !void {
         \\    zmx history <session> | tail -100
         \\
         \\Run:
-        \\  Commands are passed as-is; do not wrap in quotes.
-        \\  Commands run sequentially; do not send multiple in parallel.
-        \\  Avoid interactive programs (pagers, editors, prompts) -- they hang.
-        \\
-        \\  `-d` will detach from the calling terminal. Use `wait` to track
-        \\  its status.
+        \\  Commands are passed as-is: do not wrap in quotes.
+        \\  Commands run sequentially: do not send multiple in parallel.
+        \\  Avoid interactive programs (pagers, editors, prompts): they hang.
         \\
         \\  `--fish` is required when the session runs fish shell.
         \\
         \\  If the command hangs, send Ctrl+C to recover:
-        \\    zmx run <session> $'\\x03'
+        \\    zmx run <session> $(printf '\x03')
+        \\
+        \\  If the command hangs, print the history to see the error:
+        \\    zmx history <session> | tail -100
+        \\
+        \\  `-d` will detach from the calling terminal. Use `wait` to track
+        \\  its status.
         \\
         \\  Examples:
         \\    zmx run dev ls

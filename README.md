@@ -25,16 +25,19 @@
 - Works on mac and linux
 - This project does **NOT** provide windows, tabs, or splits
 
-[demo video](https://youtu.be/UIXj0_rhPgI?si=NolwGR4GTCQOESy6)
+## demos
+
+- [zmx - intro](https://youtu.be/UIXj0_rhPgI)
+- [zmx - ai portal](https://youtu.be/CV3skPYHP4Q)
 
 ## install
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.4.2-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.4.2-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.4.2-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.4.2-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.5.0-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.5.0-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.5.0-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.5.0-macos-x86_64.tar.gz
 
 ### homebrew
 
@@ -57,9 +60,10 @@ brew install neurosnap/tap/zmx
 - Clone the repo
 - Run build cmd
 
+Be sure to add `~/.local/bin` to your `PATH`:
+
 ```bash
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
-# be sure to add ~/.local/bin to your PATH
 ```
 
 ## usage
@@ -105,17 +109,20 @@ History:
     zmx history <session> | tail -100
 
 Run:
-  Commands are passed as-is; do not wrap in quotes.
-  Commands run sequentially; do not send multiple in parallel.
-  Avoid interactive programs (pagers, editors, prompts) -- they hang.
-
-  `-d` will detach from the calling terminal. Use `wait` to track
-  its status.
+  Commands are passed as-is: do not wrap in quotes.
+  Commands run sequentially: do not send multiple in parallel.
+  Avoid interactive programs (pagers, editors, prompts): they hang.
 
   `--fish` is required when the session runs fish shell.
 
   If the command hangs, send Ctrl+C to recover:
-    zmx run <session> $'\\x03'
+    zmx run <session> $(printf '\x03')
+
+  If the command hangs, print the history to see the error:
+    zmx history <session> | tail -100
+
+  `-d` will detach from the calling terminal. Use `wait` to track
+  its status.
 
   Examples:
     zmx run dev ls

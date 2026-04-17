@@ -14,16 +14,31 @@
 
   <body>
     <div class="debug-grid"></div>
+    <nav class="mk-nav">
+      <div class="flex flex-wrap items-center justify-center gap-2" style="margin-right: 20px;">
+        <a href="https://bower.sh/?tag=zmx" class="link-alt">
+          blog
+        </a>
+        <a href="https://github.com/neurosnap/zmx" class="link-alt">
+          src
+        </a>
+        <a href="https://web.libera.chat/gamja?autojoin=#pico.sh" class="link-alt">
+          chat
+        </a>
+      </div>
+    </nav>
     <div class="post-group" style="flex-direction: row;">
-      <article class="md toc" style="height: 98vh; padding-top: 40px;">
+      <article class="md toc" style="padding-top: 40px;">
         {{.Data.TocHtml}}
       </article>
 
-      <main class="post" style="height: 98vh;">
+      <main class="post">
         <article class="md">
           {{.Data.Html}}
         </article>
       </main>
+
+      <div class="toc"></div>
     </div>
   </body>
 </html>
