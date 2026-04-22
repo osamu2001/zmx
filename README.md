@@ -82,6 +82,9 @@ Commands:
   [wr]ite <name> <file_path>               Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
   [l]ist [--short]                         List active sessions
+  info <name> [--json]                     Show metadata for one session
+  send <name>                              Send raw stdin bytes to an existing session
+  send-keys <name> <key>...                Send symbolic key presses to an existing session
   [k]ill <name>... [--force]               Kill session and all attached clients
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
@@ -127,6 +130,16 @@ Run:
     zmx run dev zig build
     zmx run dev grep -r TODO src
     zmx run dev git -c core.pager=cat diff
+
+Info and send:
+  `info --json` prints machine-readable metadata for one session.
+  `send` forwards raw stdin bytes to the foreground process.
+  `send-keys` sends named key presses like `C-c`.
+
+  Examples:
+    zmx info dev --json
+    printf 'echo hi\r' | zmx send dev
+    zmx send-keys dev C-c
 
 Write:
   Writes stdin to file_path inside the session. Works over SSH.

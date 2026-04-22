@@ -176,13 +176,13 @@ pub const SocketBuffer = struct {
     }
 };
 
-const SessionProbeError = error{
+pub const SessionProbeError = error{
     Timeout,
     ConnectionRefused,
     Unexpected,
 };
 
-const SessionProbeResult = struct {
+pub const SessionProbeResult = struct {
     fd: i32,
     info: Info,
 };

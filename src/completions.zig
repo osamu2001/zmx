@@ -29,23 +29,39 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run detach list completions kill history version help"
+    \\  local commands="attach run detach list info send send-keys completions kill history version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
     \\    return 0
     \\  fi
     \\
+    \\  local cmd="${COMP_WORDS[1]}"
+    \\  if [[ $COMP_CWORD -eq 2 ]]; then
+    \\    case "$cmd" in
+    \\      attach|run|kill|history|info|send|send-keys)
+    \\        local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
+    \\        COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
+    \\        return 0
+    \\        ;;
+    \\    esac
+    \\  fi
+    \\
     \\  case "$prev" in
-    \\    attach|run|kill|history)
-    \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
-    \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
-    \\      ;;
     \\    completions)
     \\      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
     \\      ;;
+    \\  esac
+    \\
+    \\  case "$cmd" in
     \\    list)
     \\      COMPREPLY=($(compgen -W "--short" -- "$cur"))
+    \\      ;;
+    \\    info)
+    \\      COMPREPLY=($(compgen -W "--json" -- "$cur"))
+    \\      ;;
+    \\    send-keys)
+    \\      COMPREPLY=($(compgen -W "Enter Escape C-c Tab Up Down Left Right" -- "$cur"))
     \\      ;;
     \\    *)
     \\      ;;
@@ -74,6 +90,9 @@ const zsh_completions =
     \\        'run:Send command without attaching'
     \\        'detach:Detach all clients from current session'
     \\        'list:List active sessions'
+    \\        'info:Show metadata for one session'
+    \\        'send:Send raw stdin bytes to an existing session'
+    \\        'send-keys:Send symbolic key presses to an existing session'
     \\        'completions:Shell completion scripts'
     \\        'kill:Kill a session'
     \\        'history:Output session scrollback'
@@ -86,6 +105,25 @@ const zsh_completions =
     \\      case $words[2] in
     \\        attach|a|kill|k|run|r|history|hi)
     \\          _zmx_sessions
+    \\          ;;
+    \\        info)
+    \\          if (( CURRENT == 3 )); then
+    \\            _zmx_sessions
+    \\          else
+    \\            _values 'options' '--json'
+    \\          fi
+    \\          ;;
+    \\        send)
+    \\          if (( CURRENT == 3 )); then
+    \\            _zmx_sessions
+    \\          fi
+    \\          ;;
+    \\        send-keys)
+    \\          if (( CURRENT == 3 )); then
+    \\            _zmx_sessions
+    \\          elif (( CURRENT >= 4 )); then
+    \\            _values 'keys' 'Enter' 'Escape' 'C-c' 'Tab' 'Up' 'Down' 'Left' 'Right'
+    \\          fi
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
@@ -128,6 +166,9 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'wr write' -d 'Write stdin to file_path through the session'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients (ctrl+\ for current client)'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'l list' -d 'List active sessions'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'info' -d 'Show metadata for one session'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'send' -d 'Send raw stdin bytes to an existing session'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'send-keys' -d 'Send symbolic key presses to an existing session'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill session and all attached clients'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'hi history' -d 'Output session scrollback'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for session tasks to complete'
@@ -137,7 +178,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
     \\
     \\# Complete session names and shells
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run wr write hi history" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run wr write hi history info send send-keys" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\complete -c zmx -n "not __fish_is_nth_token 1; and __fish_seen_subcommand_from k kill w wait t tail" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
@@ -146,7 +187,9 @@ const fish_completions =
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -s d -d 'Detach from the calling terminal; use `wait` to track its status'
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -l fish -d 'Required when the session runs fish shell'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
+    \\complete -c zmx -n "__fish_seen_subcommand_from info" -l json -d 'Emit metadata as one JSON object'
     \\complete -c zmx -n "__fish_seen_subcommand_from k kill" -l force -d 'Force kill'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
     \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
+    \\complete -c zmx -n "__fish_seen_subcommand_from send-keys; and not __fish_is_nth_token 1; and not __fish_is_nth_token 2" -a 'Enter Escape C-c Tab Up Down Left Right' -d Key
 ;
